@@ -145,6 +145,10 @@ levels. Per-window RMS uses 32 ms frames.
 
 One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity`, `drop`:
 
+- The manifest generation (cache, manifest, reports) is built in `output/v5/build/` and swapped into
+  place only after invariants and minimum counts pass; a failed build leaves the previous generation
+  intact. A cached build is reused only when a fingerprint over every source file's path, size and
+  mtime, the ESC-50 metadata content and the slicing config matches.
 - `train`: WHLTalent batches other than the validation batches, ESC-50 folds 1–3, MS-SNSD training files.
 - `val` (early stopping and model selection): half of the recordings of WHLTalent batches `000002`
   (snore) and `100002` (environment), ESC-50 fold 4, 15 % of the non-bench MS-SNSD files.
@@ -181,7 +185,7 @@ from training. Flag counts go to `manifest_report.md`.
 | Step | Parameters | Probability |
 |---|---|---|
 | room impulse response | bank of 300 pyroomacoustics ShoeBox RIRs: room 3–5 m × 3–5 m × 2.4–3.0 m, RT60 0.2–0.6 s, source–mic distance 0.4–1.8 m, mic height 0.5–0.9 m, source height 0.4–0.7 m, ISM order 10, direct-path peak normalised to 1 | 0.6 |
-| additive noise | random one-second window from the training noise bank (MS-SNSD train files + ESC-50 negative windows), SNR uniform in [−5, 20] dB by RMS | 0.7 for positives, 0.4 for negatives |
+| additive noise | random one-second window from the training noise bank (training-split negatives from MS-SNSD and ESC-50 only), SNR uniform in [−5, 20] dB by RMS | 0.7 for positives, 0.4 for negatives |
 | spectral tilt | `y = x + a (x − lowpass_1kHz(x))`, a uniform in [−0.5, 0.5] | 0.3 |
 | time shift | uniform in [−100, 100] ms, zero fill | 0.5 |
 | gain and clipping | gain uniform in [−12, +6] dB, then hard clip to [−1, 1] | 0.3 |
@@ -226,11 +230,13 @@ as they are; there is no refit on more data, so the test evaluation applies to t
 Threshold τ (calibration split): the smallest float strictly above the largest negative score that
 may still pass, so at most ⌊max_fpr · n_neg⌋ calibration negatives score at or above τ (max_fpr
 1 %). Calibration fails closed: fewer than 300 calibration negatives, no finite τ ≤ 1, or zero
-positive recall raise an error and nothing is deployed. `threshold.json` records τ, the SHA-256 of the
-deployed model file (the exporter refuses a model that does not match), the measured calibration
-FPR with its 95 % Clopper–Pearson upper bound, recall, the FSM parameters of section 8 and
-`model_version = "cnn_v5_int8"`. The version string must never contain `simulator`, `demo` or
-`mock`; the cloud treats such events as simulated data.
+positive recall raise an error and nothing is deployed. `deployed/threshold.json` records τ, the SHA-256 of the deployed
+model file (the exporter refuses a model that does not match), the measured calibration FPR with
+its 95 % Clopper–Pearson upper bound, recall, the FSM parameters of section 8 and
+`model_version = "cnn_v5_int8"`. The model, its metrics and its threshold are written as one
+`deployed/` generation and swapped in atomically. The version string must never contain
+`simulator`, `demo` or `mock` (the cloud treats such events as simulated data); `train final` and
+the exporter both refuse such a version.
 
 ## 7. Evaluation and acceptance
 
@@ -327,8 +333,9 @@ cloud repo's pydantic `EventIn` when that repo is present on disk (skipped other
 release gate passes. Promotion is transactional: complete sibling trees for `deliverables/` and
 `generated/` are built, then both are swapped in by rename with backups kept until both swaps
 succeed; any failure restores both previous trees. The successful `export_status.json` is written
-into the stage and travels inside the swap, and post-swap cleanup is best-effort. Gates (checked
-after the threshold/model SHA-256 binding): TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
+into the stage and travels inside the swap; a failed attempt is recorded in the stage and in
+`output/v5/export_last_attempt.json` and never touches the live release; post-swap cleanup is
+best-effort. Gates (checked after the model-version rule and the threshold/model SHA-256 binding): TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
 set is within {CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED, LOGISTIC, RESHAPE, QUANTIZE,
 DEQUANTIZE}; int8 parity on the test split meets the limits of section 7. A failed gate raises,
 keeps the stage directory for diagnosis, records `failed` in `deliverables/export_status.json` and

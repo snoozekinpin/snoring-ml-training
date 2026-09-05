@@ -969,12 +969,12 @@ git commit -m "feat(v5): source decoding and one-second window slicing"
 
 **Interfaces:**
 - Consumes: `v5.data.sources` (`iter_windows`, `SOURCE_IDS`, `TEST_SOURCES`), `v5.features` (`float_to_int16`, `extract_int16`).
-- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `PARTITIONS` (`test, train, val, calib, bench` in priority order), `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `class TestSplitAccess(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `cache_fingerprint(data_dir, data_cfg) -> str`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]` (keeps every decoded window, exact duplicates included; dedup is resolved after split assignment), `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `load_exact_conflicts(out_dir) -> list[str]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `resolve_partitions(rows, split) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split, *, allow_test=False) -> np.ndarray[int]` (raises `TestSplitAccess` for `test` unless `allow_test=True`; only `v5/export.py` may pass it).
-- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/meta.json` (fingerprint), `exact_dups.json`, `exact_conflicts.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
+- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `PARTITIONS` (`test, train, val, calib, bench` in priority order), `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `class TestSplitAccess(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `cache_fingerprint(data_dir, data_cfg) -> str` (SHA-256 over every source wav's relative path, size and mtime, the ESC-50 metadata content, the slicing config and the feature spec version), `GENERATION_ITEMS`, `promote_generation(out_dir, build_dir) -> None`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]` (keeps every decoded window, exact duplicates included; dedup is resolved after split assignment), `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `load_exact_conflicts(out_dir) -> list[str]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `resolve_partitions(rows, split) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split, *, allow_test=False) -> np.ndarray[int]` (raises `TestSplitAccess` for `test` unless `allow_test=True`; only `v5/export.py` may pass it).
+- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/meta.json` (fingerprint), `exact_dups.json`, `exact_conflicts.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`. Everything is produced in `out_dir/build/` first and swapped into place only after the invariants and minimum counts pass, so a failed build leaves the previous generation (cache and manifest together) intact.
 - Split values (single `split` column): `train`, `val` (early stopping and model selection), `calib` (threshold calibration), `test` (Kaggle, read only by the exporter), `bench` (streaming benchmark and DoA sweep material plus MS-SNSD noise beds), `sanity`, `drop`.
 - Split rule (deterministic, from `cfg["data"]`): WHLTalent recordings whose batch id (`category`) is in `whl_val_batches` are split by recording, `whl_bench_frac` (ceil) → bench, rest → val; other WHLTalent batches → train. ESC-50 fold `esc50_val_fold` → val, fold `esc50_calib_fold` → calib, other folds → train. MS-SNSD files: `bench_frac` → bench, then `mssnsd_val_frac` → val, `mssnsd_calib_frac` → calib, rest → train (seeded). Kaggle → test; wild → sanity.
 - Isolation rule, applied after split assignment in this order: (1) exact-duplicate waveforms (same MD5): conflicting labels → every copy dropped (`exact_conflict`); otherwise exactly one copy survives, in the highest-priority partition among the copies (`PARTITIONS` order, `test` first), the others are dropped (`exact_dup`); (2) near-duplicate clusters with conflicting labels → dropped everywhere (`conflict`); (3) a group or cluster spanning several partitions keeps only its highest-priority partition (`partition`). The test set therefore never loses a window to a training copy.
-- Fail-closed rule: the dataset root must contain `whltalent/s*`, `whltalent/e*`, `esc50/audio`, `esc50/meta/esc50.csv` and at least one MS-SNSD wav; every required source must yield at least one decoded window; a cached build is reused only when its fingerprint (data root, per-source file counts, data config) matches; minimum window counts per partition are enforced.
+- Fail-closed rule: the dataset root must contain `whltalent/s*`, `whltalent/e*`, `esc50/audio`, `esc50/meta/esc50.csv` and at least one MS-SNSD wav; every required source must yield at least one decoded window; a cached build is reused only when its fingerprint (every source file's path, size and mtime, the ESC-50 metadata content, the slicing config) matches; minimum window counts per partition are enforced.
 - Leakage statement (goes into the report): WHLTalent carries no subject metadata, so the split is batch-disjoint (file-name prefix) for train vs val/bench and recording-disjoint between val and bench, not proven subject-disjoint; ESC-50 uses its official folds; the Kaggle test set is a separate collection never used for training, selection, calibration, benchmark material or teacher scoring.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1135,6 +1135,29 @@ def test_cache_reuse_validates_fingerprint(mini_dataset, tmp_path):
     assert any(r["category"] == "000009" for r in rows2) and not any(r["category"] == "000002" for r in rows2)
 
 
+def test_cache_reuse_detects_content_and_metadata_changes(mini_dataset, tmp_path):
+    fp0 = M.cache_fingerprint(mini_dataset, load_config()["data"])
+    target = mini_dataset / "adrianagaler" / "noise" / "adria_n_0000.wav"
+    sf.write(target, 0.03 * np.random.default_rng(8).standard_normal(F.SR).astype(np.float32), F.SR, subtype="PCM_16")  # same count, new content
+    fp1 = M.cache_fingerprint(mini_dataset, load_config()["data"])
+    assert fp1 != fp0
+    meta = mini_dataset / "esc50" / "meta" / "esc50.csv"
+    meta.write_text(meta.read_text().replace("rain,False", "rain,True"))  # metadata-only change
+    assert M.cache_fingerprint(mini_dataset, load_config()["data"]) != fp1
+
+
+def test_failed_rebuild_keeps_previous_generation(mini_dataset, tmp_path):
+    out = tmp_path / "out"
+    rows = M.build_manifest(mini_dataset, out, _cfg())
+    snapshot = {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    cfg = _cfg()
+    cfg["data"]["min_counts"]["train_pos"] = 10_000
+    with pytest.raises(M.DatasetMissing):
+        M.build_manifest(mini_dataset, out, cfg)  # full rebuild that fails validation
+    assert {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file() and "build" not in p.parts} == snapshot
+    assert M.read_manifest(out / "manifest.csv") == rows and not (out / "build").exists()
+
+
 def test_required_source_failures(mini_dataset, tmp_path):
     for f in (mini_dataset / "esc50" / "audio").glob("*.wav"):
         f.write_bytes(b"corrupt")
@@ -1169,6 +1192,8 @@ import csv
 import hashlib
 import json
 import math
+import os
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -1200,6 +1225,37 @@ class TestSplitAccess(RuntimeError):
     """The test split may only be read by v5/export.py."""
 
 
+GENERATION_ITEMS = ("cache", "manifest.csv", "manifest_report.md", "manifest_errors.csv", "exact_dups.json", "exact_conflicts.json")
+
+
+def promote_generation(out_dir, build_dir) -> None:
+    """Swap the validated items of build_dir into out_dir; on failure the previous generation is restored."""
+    out_dir, build_dir = Path(out_dir), Path(build_dir)
+    bak = out_dir / "manifest_prev"
+    if bak.exists():
+        shutil.rmtree(bak)
+    bak.mkdir(parents=True)
+    moved = []
+    try:
+        for name in GENERATION_ITEMS:
+            new, live = build_dir / name, out_dir / name
+            if not new.exists():
+                continue  # e.g. a reused cache stays live
+            if live.exists():
+                os.rename(live, bak / name)
+                moved.append(name)
+            os.rename(new, live)
+    except Exception:
+        for name in moved:
+            live = out_dir / name
+            if live.exists():
+                shutil.rmtree(live) if live.is_dir() else live.unlink()
+            os.rename(bak / name, live)
+        raise
+    shutil.rmtree(bak, ignore_errors=True)
+    shutil.rmtree(build_dir, ignore_errors=True)
+
+
 def _required_paths(data_dir: Path) -> dict:
     return {
         "whltalent/s* (whl_s)": sorted(p for p in (data_dir / "whltalent").glob("s*") if p.is_dir()),
@@ -1219,20 +1275,22 @@ def check_dataset_root(data_dir) -> None:
         raise DatasetMissing(f"dataset root {data_dir} is incomplete; missing: {', '.join(missing)}")
 
 
+SOURCE_DIRS = ("whltalent", "esc50/audio", "RAW/MS-SNSD/noise_train", "adrianagaler", "snoring_extra/jibran", "RAW/Snore_Detection_Project/Snore_Detection/inference_audios")
+
+
 def cache_fingerprint(data_dir, data_cfg: dict) -> str:
+    """Changes whenever any source file (path, size, mtime), the ESC-50 metadata or the slicing config changes."""
     data_dir = Path(data_dir).resolve()
-    counts = {
-        "whl_s": sum(len(list(p.glob("*.wav"))) for p in (data_dir / "whltalent").glob("s*") if p.is_dir()),
-        "whl_e": sum(len(list(p.glob("*.wav"))) for p in (data_dir / "whltalent").glob("e*") if p.is_dir()),
-        "esc50": len(list((data_dir / "esc50" / "audio").glob("*.wav"))),
-        "mssnsd": len(list((data_dir / "RAW" / "MS-SNSD" / "noise_train").glob("*.wav"))),
-        "kaggle_adria": len(list((data_dir / "adrianagaler").rglob("*.wav"))),
-        "kaggle_jibran": len(list((data_dir / "snoring_extra" / "jibran").glob("*.wav"))),
-        "whl_dirs": sorted(p.name for p in (data_dir / "whltalent").iterdir() if p.is_dir()),
-    }
-    slicing = {k: v for k, v in data_cfg.items() if k.endswith("_windows") or k.endswith("_stride_s")}
-    payload = json.dumps({"data_dir": str(data_dir), "counts": counts, "slicing": slicing, "feature_spec": F.FEATURE_SPEC_VERSION}, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    h = hashlib.sha256(json.dumps({"data_dir": str(data_dir), "feature_spec": F.FEATURE_SPEC_VERSION,
+                                   "slicing": {k: v for k, v in data_cfg.items() if k.endswith("_windows") or k.endswith("_stride_s")}}, sort_keys=True).encode("utf-8"))
+    for sub_dir in SOURCE_DIRS:
+        for p in sorted((data_dir / sub_dir).rglob("*.wav")):
+            st = p.stat()
+            h.update(f"{p.relative_to(data_dir)}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+    meta = data_dir / "esc50" / "meta" / "esc50.csv"
+    if meta.exists():
+        h.update(meta.read_bytes())
+    return h.hexdigest()
 
 
 def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
@@ -1265,7 +1323,7 @@ def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
     np.save(out_dir / "cache" / "feats.npy", feats)
     (out_dir / "cache" / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
     (out_dir / "cache" / "meta.json").write_text(json.dumps({"fingerprint": cache_fingerprint(data_dir, cfg.get("data", {})), "windows": len(rows), "per_source": dict(per_source)}), encoding="utf-8")
-    with open(out_dir / "manifest_errors.csv", "w", newline="", encoding="utf-8") as fh:
+    with open(out_dir / "manifest_errors.csv", "w", newline="", encoding="utf-8") as fh:  # out_dir is the build directory here
         wr = csv.DictWriter(fh, fieldnames=["path", "error"])
         wr.writeheader()
         wr.writerows(errors)
@@ -1497,28 +1555,37 @@ def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bo
     out_dir = Path(out_dir)
     d = cfg.get("data", {})
     check_dataset_root(data_dir)
+    build = out_dir / "build"
+    if build.exists():
+        shutil.rmtree(build)
+    build.mkdir(parents=True)
     meta = out_dir / "cache" / "meta.json"
     fresh = reuse_cache and meta.exists() and json.loads(meta.read_text(encoding="utf-8")).get("fingerprint") == cache_fingerprint(data_dir, d)
     if reuse_cache and not fresh:
         print("[manifest] cache fingerprint mismatch or missing: rebuilding")
-    rows, audio, feats = load_cache(out_dir) if fresh else build_cache(data_dir, out_dir, cfg, seed)
-    clusters = near_dup_clusters(feats, float(d.get("near_dup_threshold", 0.98)))
-    for r, c in zip(rows, clusters):
-        r["dup_cluster"] = int(c)
-    split, dropped = resolve_partitions(rows, assign_splits(rows, d, seed))
-    for r, s in zip(rows, split):
-        r["split"] = s
-    check_invariants(rows)
-    check_min_counts(rows, d.get("min_counts", {}))
-    exact_dups, exact_conflicts = _exact_dup_provenance(rows)
-    (out_dir / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
-    (out_dir / "exact_conflicts.json").write_text(json.dumps(exact_conflicts), encoding="utf-8")
-    members = defaultdict(list)
-    for r in rows:
-        if r["split"] in PARTITIONS:
-            members[r["dup_cluster"]].append(r["source"])
-    write_manifest(rows, out_dir / "manifest.csv")
-    _report(rows, exact_dups, exact_conflicts, dropped, members, out_dir / "manifest_report.md")
+    try:
+        rows, audio, feats = load_cache(out_dir) if fresh else build_cache(data_dir, build, cfg, seed)
+        clusters = near_dup_clusters(feats, float(d.get("near_dup_threshold", 0.98)))
+        for r, c in zip(rows, clusters):
+            r["dup_cluster"] = int(c)
+        split, dropped = resolve_partitions(rows, assign_splits(rows, d, seed))
+        for r, s in zip(rows, split):
+            r["split"] = s
+        check_invariants(rows)
+        check_min_counts(rows, d.get("min_counts", {}))
+        exact_dups, exact_conflicts = _exact_dup_provenance(rows)
+        (build / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
+        (build / "exact_conflicts.json").write_text(json.dumps(exact_conflicts), encoding="utf-8")
+        members = defaultdict(list)
+        for r in rows:
+            if r["split"] in PARTITIONS:
+                members[r["dup_cluster"]].append(r["source"])
+        write_manifest(rows, build / "manifest.csv")
+        _report(rows, exact_dups, exact_conflicts, dropped, members, build / "manifest_report.md")
+    except Exception:
+        shutil.rmtree(build, ignore_errors=True)  # the previous generation in out_dir is untouched
+        raise
+    promote_generation(out_dir, build)
     return rows
 
 
@@ -2464,9 +2531,10 @@ git commit -m "feat(v5): clip metrics, robustness sweep and int8 inference helpe
 **Interfaces:**
 - Consumes: `v5.data.manifest` (`read_manifest`, `load_cache`, `split_indices`), `v5.data.augment`, `v5.data.dataset`, `v5.model.build_model`, `v5.evaluate`, `v5.teacher` (`read_scores`, `platt_fit`, `platt_apply`).
 - Produces: `make_kd_loss(alpha: float) -> callable` and `kd_loss = make_kd_loss(0.5)`, `class ValAuc(keras.callbacks.Callback)`, `build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray`, `train_one(cfg, use_kd, width, epochs, name, seed=42) -> dict`, `class CalibrationError(RuntimeError)`, `fpr_upper_bound(fp, n, conf=0.95) -> float`, `choose_threshold(y_calib, p_calib, max_fpr=0.01, min_neg=300) -> tuple[float, dict]`, `select_config(results: list[dict]) -> dict`, `run_report(out_dir) -> str`, CLI `python -m v5.train {run,select,final,report}`.
-- Files: `output/v5/runs/<name>/{model.keras,metrics.json,history.json}`, `output/v5/selection.json`, `output/v5/threshold.json`, `output/v5/deployed/{model.keras,metrics.json}`, `output/v5/deliverables/experiments.md`.
+- Files: `output/v5/runs/<name>/{model.keras,metrics.json,history.json}`, `output/v5/selection.json`, `output/v5/deployed/{model.keras,metrics.json,threshold.json}` (one generation, written to `deployed.new/` and swapped in atomically), `output/v5/deliverables/experiments.md`.
+- `noise_bank_ids(rows, train_ids) -> np.ndarray` selects training negatives whose source is `mssnsd` or `esc50` (the augmentation noise bank of spec section 5); `deploy_generation(out_dir, run_dir, metrics: dict, threshold: dict) -> Path` stages `deployed.new/`, computes the model SHA from the staged file, writes `threshold.json` with it and swaps the directory in, restoring the previous one on failure. `train final` calls `check_model_version` (from `v5.events`) before deploying.
 - `file_sha256(path) -> str`.
-- `threshold.json` schema: `{"tau": float, "model_version": str, "model_sha256": str (SHA-256 of the deployed model.keras), "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
+- `deployed/threshold.json` schema: `{"tau": float, "model_version": str, "model_sha256": str (SHA-256 of the deployed model.keras), "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
 - Calibration contract: tau is the smallest float strictly above the largest negative score that may still pass, so at most `floor(max_fpr * n_neg)` calibration negatives score at or above tau. Fewer than `min_neg` negatives, a tau above 1.0, or zero positive recall raise `CalibrationError`; nothing is written in that case.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2510,6 +2578,39 @@ def test_choose_threshold_fails_closed():
         TR.choose_threshold(y, np.r_[np.full(300, 0.2), np.full(300, 0.9)], max_fpr=0.01)
     with pytest.raises(TR.CalibrationError):  # negatives saturate at 1.0
         TR.choose_threshold(y, np.r_[np.full(300, 1.0), np.full(300, 1.0)], max_fpr=0.01)
+
+
+def test_noise_bank_uses_mssnsd_and_esc50_negatives_only():
+    rows = [{"id": i, "label": lab, "source": src} for i, (lab, src) in enumerate([(0, "mssnsd"), (0, "esc50"), (0, "whl_e"), (1, "esc50"), (0, "mssnsd")])]
+    assert list(TR.noise_bank_ids(rows, [0, 1, 2, 3, 4])) == [0, 1, 4]
+
+
+def test_deploy_generation_is_atomic(tmp_path, monkeypatch):
+    from v5.model import build_model
+
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    build_model(0.5).save(run / "model.keras")
+    live = TR.deploy_generation(tmp_path, run, {"name": "r1"}, {"tau": 0.6, "model_version": "cnn_v5_int8"})
+    thr = json.loads((live / "threshold.json").read_text())
+    assert thr["model_sha256"] == TR.file_sha256(live / "model.keras") and (live / "metrics.json").exists()
+    before = {p.name: p.read_bytes() for p in live.iterdir()}
+    run2 = tmp_path / "runs" / "r2"
+    run2.mkdir()
+    build_model(0.5).save(run2 / "model.keras")
+    real_rename, calls = TR.os.rename, {"n": 0}
+
+    def failing_rename(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:  # after the live generation was moved aside
+            raise OSError("injected")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(TR.os, "rename", failing_rename)
+    with pytest.raises(OSError):
+        TR.deploy_generation(tmp_path, run2, {"name": "r2"}, {"tau": 0.7, "model_version": "cnn_v5_int8"})
+    monkeypatch.setattr(TR.os, "rename", real_rename)
+    assert {p.name: p.read_bytes() for p in live.iterdir()} == before and not (tmp_path / "deployed.new").exists()
 
 
 def test_file_sha256(tmp_path):
@@ -2575,6 +2676,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shutil
 import time
 from pathlib import Path
@@ -2590,6 +2692,7 @@ from v5.data import manifest as M
 from v5.data.augment import AugmentConfig, Augmenter, RirBank
 from v5.data.dataset import TrainDataset, precompute_features
 from v5.evaluate import clip_metrics, predict_probs, sigmoid
+from v5.events import check_model_version
 from v5.model import build_model
 
 _BCE = keras.losses.BinaryCrossentropy(from_logits=True)
@@ -2650,6 +2753,12 @@ def build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray:
     return soft.astype(np.float32)
 
 
+def noise_bank_ids(rows, train_ids) -> np.ndarray:
+    """Training negatives from MS-SNSD and ESC-50 only (spec section 5); WHLTalent environment windows are not mixed in as noise."""
+    allowed = {"mssnsd", "esc50"}
+    return np.array([i for i in train_ids if rows[i]["label"] == 0 and rows[i]["source"] in allowed], dtype=int)
+
+
 def _teacher_excluded(rows, teacher_csv) -> set[int]:
     if not Path(teacher_csv).exists():
         return set()
@@ -2673,7 +2782,7 @@ def train_one(cfg: dict, use_kd: bool, width: float, epochs: int, name: str, see
     soft = build_soft_targets(rows, out / "teacher.csv", tr) if use_kd else y
     rng = np.random.default_rng(seed)
     rir_bank = RirBank.load_or_generate(out / "rir_bank.npz", int(cfg["augment"]["rir_bank_size"]), seed)
-    aug = Augmenter(AugmentConfig.from_dict(cfg["augment"]), audio[tr][y[tr] == 0], rir_bank, rng)
+    aug = Augmenter(AugmentConfig.from_dict(cfg["augment"]), audio[noise_bank_ids(rows, tr)], rir_bank, rng)
     ds = TrainDataset(audio[tr], y[tr], soft[tr], aug, batch=int(tcfg["batch"]), seed=seed, workers=int(tcfg.get("workers", 8)))
     Xv, yv = precompute_features(audio[va]), y[va]
     keras.utils.set_random_seed(seed)
@@ -2734,6 +2843,32 @@ def choose_threshold(y_calib, p_calib, max_fpr: float = 0.01, min_neg: int = 300
     return tau, info
 
 
+def deploy_generation(out_dir, run_dir, metrics: dict, threshold: dict) -> Path:
+    """Write model.keras, metrics.json and threshold.json as one generation and swap it into out_dir/deployed."""
+    out_dir, run_dir = Path(out_dir), Path(run_dir)
+    live, new, bak = out_dir / "deployed", out_dir / "deployed.new", out_dir / "deployed.bak"
+    for d in (new, bak):
+        if d.exists():
+            shutil.rmtree(d)
+    new.mkdir(parents=True)
+    shutil.copy(run_dir / "model.keras", new / "model.keras")
+    threshold = {**threshold, "model_sha256": file_sha256(new / "model.keras")}
+    (new / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    (new / "threshold.json").write_text(json.dumps(threshold, indent=2), encoding="utf-8")
+    had_live = live.exists()
+    try:
+        if had_live:
+            os.rename(live, bak)
+        os.rename(new, live)
+    except Exception:
+        if had_live and bak.exists() and not live.exists():
+            os.rename(bak, live)
+        shutil.rmtree(new, ignore_errors=True)
+        raise
+    shutil.rmtree(bak, ignore_errors=True)
+    return live
+
+
 def select_config(results: list[dict]) -> dict:
     best_auc = max(r["val"]["auc"] for r in results)
     best_rec = max(r["val"]["recall_at_fpr2"] for r in results)
@@ -2751,9 +2886,9 @@ def run_report(out_dir) -> str:
     sel = out / "selection.json"
     if sel.exists():
         lines += ["", f"selected: `{json.loads(sel.read_text())['name']}`"]
-    thr = out / "threshold.json"
+    thr = out / "deployed" / "threshold.json"
     if thr.exists():
-        lines += ["", "threshold.json (calibrated on the calib split):", "```json", thr.read_text().strip(), "```"]
+        lines += ["", "deployed/threshold.json (calibrated on the calib split):", "```json", thr.read_text().strip(), "```"]
     return "\n".join(lines) + "\n"
 
 
@@ -2782,6 +2917,7 @@ def main(argv=None) -> None:
         (out / "selection.json").write_text(json.dumps({"name": chosen["name"], "kd": chosen["kd"], "width": chosen["width"]}, indent=2))
         print("selected:", chosen["name"])
     elif args.cmd == "final":
+        check_model_version(cfg["model_version"])  # never deploy a version the cloud would treat as simulated
         sel = json.loads((out / "selection.json").read_text())
         run_dir = out / "runs" / sel["name"]
         rows = M.read_manifest(out / "manifest.csv")
@@ -2793,14 +2929,10 @@ def main(argv=None) -> None:
         tau, info = choose_threshold(yc, pc, float(cfg["threshold"]["max_fpr"]), int(cfg["threshold"]["min_calib_neg"]))
         if info["fpr"] > float(cfg["threshold"]["max_fpr"]):
             raise CalibrationError(f"measured calibration FPR {info['fpr']:.4f} exceeds {cfg['threshold']['max_fpr']}")
-        (out / "deployed").mkdir(exist_ok=True)
-        shutil.copy(run_dir / "model.keras", out / "deployed" / "model.keras")
         run_metrics = json.loads((run_dir / "metrics.json").read_text())
         run_metrics["calib"] = info
-        (out / "deployed" / "metrics.json").write_text(json.dumps(run_metrics, indent=2))
-        sha = file_sha256(out / "deployed" / "model.keras")
-        (out / "threshold.json").write_text(json.dumps({"tau": tau, "model_version": cfg["model_version"], "model_sha256": sha, "max_fpr": cfg["threshold"]["max_fpr"], "run": sel["name"], "calib": info, "fsm": cfg["fsm"]}, indent=2))
-        print(f"deployed {sel['name']} with tau={tau:.4f} calib_fpr={info['fpr']:.4f} (95% upper {info['fpr_upper95']:.4f}) calib_recall={info['recall']:.3f}")
+        deploy_generation(out, run_dir, run_metrics, {"tau": tau, "model_version": cfg["model_version"], "max_fpr": cfg["threshold"]["max_fpr"], "run": sel["name"], "calib": info, "fsm": cfg["fsm"]})
+        print(f"deployed {sel['name']} -> {out / 'deployed'} with tau={tau:.4f} calib_fpr={info['fpr']:.4f} (95% upper {info['fpr_upper95']:.4f}) calib_recall={info['recall']:.3f}")
     elif args.cmd == "report":
         (out / "deliverables").mkdir(parents=True, exist_ok=True)
         text = run_report(out)
@@ -2881,7 +3013,7 @@ git commit -m "data(v5): real manifest built; report with dedup, split counts an
 ### Task 13: Training experiments, validation selection, calibration
 
 **Files:**
-- Create: `output/v5/runs/*` (untracked), `output/v5/selection.json`, `output/v5/threshold.json`, `output/v5/deployed/*` (untracked), `output/v5/deliverables/experiments.md` (tracked)
+- Create: `output/v5/runs/*` (untracked), `output/v5/selection.json`, `output/v5/deployed/{model.keras,metrics.json,threshold.json}` (untracked), `output/v5/deliverables/experiments.md` (tracked)
 
 - [ ] **Step 1: Run the four configurations**
 
@@ -2897,7 +3029,7 @@ Expected: each prints validation metrics (AUC and recall_at_fpr2). If the teache
 - [ ] **Step 2: Select on validation and calibrate on the calib split**
 
 Run: `.venv-mac/bin/python -m v5.train select && .venv-mac/bin/python -m v5.train final`
-Expected: `selected: <name>` then `deployed <name> with tau=... calib_fpr<=0.01 (95% upper ...) calib_recall=...`; `output/v5/threshold.json` exists with `model_version` `cnn_v5_int8`. A `CalibrationError` stops here by design; investigate the calib split before retrying.
+Expected: `selected: <name>` then `deployed <name> with tau=... calib_fpr<=0.01 (95% upper ...) calib_recall=...`; `output/v5/deployed/threshold.json` exists with `model_version` `cnn_v5_int8` and the model's SHA-256. A `CalibrationError` stops here by design; investigate the calib split before retrying.
 
 - [ ] **Step 3: Write the experiments report and commit**
 
@@ -3579,7 +3711,7 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
     cfg = resolve(load_config(args.config))
     out = Path(cfg["paths"]["out_dir"])
-    thr = json.loads(Path(args.threshold or out / "threshold.json").read_text())
+    thr = json.loads(Path(args.threshold or out / "deployed" / "threshold.json").read_text())
     params = FsmParams.from_config(thr["tau"], thr["fsm"])
     model = keras.models.load_model(args.model or out / "deployed" / "model.keras", compile=False)
     tflite = Path(args.tflite or out / "deliverables" / "snore_v5_int8.tflite").read_bytes()
@@ -4149,10 +4281,10 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `check_threshold_binding(model_path, thr: dict) -> str` (raises `ExportError` unless `thr["model_sha256"]` equals the SHA-256 of the model file), `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
 - Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees. The successful `export_status.json` is written into the stage and travels inside the swap, so a live release always carries its own status; cleanup of backups and the stage after the swap is best-effort and never fails the export.
-- The exporter verifies `threshold.json`'s `model_sha256` against the model file before it reads the manifest or the test split.
-- Release gates (all must pass before anything is promoted; the threshold/model binding is checked first): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
+- The exporter verifies the model version and `threshold.json`'s `model_sha256` before it reads the manifest or the test split. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
+- Release gates (all must pass before anything is promoted; the threshold/model binding is checked first): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, the attempt is recorded in `export_stage/export_status.json` and `output/v5/export_last_attempt.json`, and the promoted release including its own `export_status.json` is left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4233,6 +4365,10 @@ def test_threshold_must_be_bound_to_the_model(tmp_path):
         X.check_threshold_binding(tmp_path / "b.keras", thr)
     with pytest.raises(X.ExportError):
         X.check_threshold_binding(tmp_path / "a.keras", {"tau": 0.6})
+    for bad in ("mock_v5", "cnn_demo", "simulator"):
+        with pytest.raises(X.ExportError):
+            X.precheck_release(tmp_path / "a.keras", {**thr, "model_version": bad})
+    assert X.precheck_release(tmp_path / "a.keras", {**thr, "model_version": "cnn_v5_int8"}) == thr["model_sha256"]
 
 
 def _stage(tmp_path, tag):
@@ -4341,6 +4477,16 @@ def check_threshold_binding(model_path, thr: dict) -> str:
     if not expected or expected != actual:
         raise ExportError(f"threshold.json is bound to model sha256 {expected}, but {model_path} has {actual}; re-run `python -m v5.train final`")
     return actual
+
+
+def precheck_release(model_path, thr: dict) -> str:
+    from v5.events import check_model_version
+
+    try:
+        check_model_version(str(thr.get("model_version", "")))
+    except ValueError as exc:
+        raise ExportError(str(exc)) from exc
+    return check_threshold_binding(model_path, thr)
 
 
 def to_tflite_int8(model, rep_X) -> bytes:
@@ -4665,12 +4811,12 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
             shutil.rmtree(stage)
         golden = stage / "golden"
         golden.mkdir(parents=True)
-        thr = json.loads(Path(threshold_path or out / "threshold.json").read_text())
+        thr = json.loads(Path(threshold_path or out / "deployed" / "threshold.json").read_text())
         tau, model_version = float(thr["tau"]), thr["model_version"]
         fsm = FsmParams.from_config(tau, thr["fsm"])
         doa = DoaParams(spacing_m=float(cfg["doa"]["spacing_m"]))
         model_file = Path(model_path or out / "deployed" / "model.keras")
-        model_sha = check_threshold_binding(model_file, thr)  # before any manifest or test-split access
+        model_sha = precheck_release(model_file, thr)  # version rule and model binding, before any manifest or test-split access
         model = keras.models.load_model(model_file, compile=False)
         check_ops(model)
         rows = M.read_manifest(out / "manifest.csv")
@@ -4709,8 +4855,11 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         except OSError as exc:  # the release is live; leftover stage files are harmless
             print(f"[export] warning: could not remove {stage}: {exc}")
         return info
-    except Exception as exc:
-        _write_status(deliv, "failed", error=f"{type(exc).__name__}: {exc}", stage=str(stage))
+    except Exception as exc:  # the live release and its status stay untouched; the attempt is recorded next to the stage
+        failed = {"error": f"{type(exc).__name__}: {exc}", "stage": str(stage)}
+        if stage.exists():
+            _write_status(stage, "failed", **failed)
+        (out / "export_last_attempt.json").write_text(json.dumps({"status": "failed", "at": datetime.now().isoformat(timespec="seconds"), **failed}, indent=1))
         raise
 
 
@@ -4768,7 +4917,7 @@ def main(argv=None) -> None:
     cfg = resolve(load_config(args.config))
     out = Path(cfg["paths"]["out_dir"])
     if args.cmd == "headers":
-        thr = out / "threshold.json"
+        thr = out / "deployed" / "threshold.json"
         tau = json.loads(thr.read_text())["tau"] if thr.exists() else 0.65
         write_headers_only(GEN_DIR, out / "deliverables" / "golden", FsmParams.from_config(tau, cfg["fsm"]), DoaParams(spacing_m=float(cfg["doa"]["spacing_m"])))
         print(f"headers -> {GEN_DIR}; golden -> {out / 'deliverables' / 'golden'}")
@@ -5597,7 +5746,7 @@ git commit -m "feat(fw-v5): GCC-PHAT direction module in C with golden-case and 
 - [ ] **Step 1: Export through the gates (the only evaluation on the test split)**
 
 Run: `.venv-mac/bin/python -m v5.export model`
-Expected: JSON summary with `parity.passed: true` and float/int8 test metrics; `output/v5/deliverables/export_status.json` says `ok`; `esp32_firmware/v5/generated/model_data.c` is a few hundred KB. An `ExportError` leaves `output/v5/export_stage/` for diagnosis and records `failed` in `export_status.json`; do not hand-copy anything out of the stage directory.
+Expected: JSON summary with `parity.passed: true` and float/int8 test metrics; `output/v5/deliverables/export_status.json` says `ok`; `esp32_firmware/v5/generated/model_data.c` is a few hundred KB. An `ExportError` leaves `output/v5/export_stage/` for diagnosis and records the failed attempt in `output/v5/export_last_attempt.json`; the previous release is untouched; do not hand-copy anything out of the stage directory.
 
 - [ ] **Step 2: Streaming benchmark on both paths and the DoA sweep**
 
@@ -5978,7 +6127,7 @@ def finetune(model_path, sessions, holdout, out_dir, epochs: int = 10, lr: float
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save(out_dir / "model.keras")
     metrics = {"model_version": version, "deployable": False, "n_train": int(len(y)), "n_holdout": int(len(h_y)), "tau": tau, "epochs": epochs, "before": before, "after": after,
-               "to_deploy": "copy model.keras to output/v5/runs/<name>/, write selection.json, run `python -m v5.train final` (re-calibrates on the calib split) and `python -m v5.export model` (release gates)"}
+               "to_deploy": "copy model.keras to output/v5/runs/<name>/, write selection.json, run `python -m v5.train final` (re-calibrates on the calib split and binds the threshold to the model) and `python -m v5.export model` (release gates)"}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
 
@@ -5994,7 +6143,7 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
     cfg = resolve(load_config(args.config))
     out_root = Path(cfg["paths"]["out_dir"])
-    thr = out_root / "threshold.json"
+    thr = out_root / "deployed" / "threshold.json"
     tau = json.loads(thr.read_text())["tau"] if thr.exists() else 0.65  # no calibration yet: development default
     m = finetune(args.model or out_root / "deployed" / "model.keras", args.sessions, args.holdout,
                  args.out or out_root / "finetune" / date.today().strftime("%Y%m%d"), args.epochs, tau=tau, seed=cfg["seed"])
