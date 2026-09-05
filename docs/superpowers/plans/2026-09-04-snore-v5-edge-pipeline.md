@@ -3746,7 +3746,7 @@ git commit -m "feat(v5): streaming benchmark with int8 path and one-to-one event
 
 **Interfaces:**
 - Consumes: `v5.features.hann_periodic`.
-- Produces: `@dataclass(frozen=True) DoaParams(spacing_m=0.06, fs=16000, c=343.0, band=(60.0,3000.0), n_fft=512, deadzone=0.2, min_ratio=1.5, floor_margin_db=6.0)` with property `max_lag: int`; `gcc_phat(l, r, max_lag, fs=16000, band=(60,3000), n_fft=512) -> tuple[float lag, float ratio]`; `frame_level_db(x) -> float`; `class NoiseFloor(init_db=-60.0, alpha=0.02)` with `update(level_db) -> float`; `side_from_lag(lag, max_lag, deadzone=0.2) -> str`; `class DoaTracker(params)` with `reset()`, `frame(l, r) -> tuple[float, bool]`, `episode() -> dict(side, lag_samples, lag_ms, conf, n_valid)`; `both_sides_rule(episodes, min_conf=0.7, min_share=0.25) -> bool`.
+- Produces: `@dataclass(frozen=True) DoaParams(spacing_m=0.06, fs=16000, c=343.0, band=(60.0,3000.0), n_fft=512, deadzone=0.2, min_ratio=1.5, floor_margin_db=6.0)` with property `max_lag: int`; `gcc_phat(l, r, max_lag, fs=16000, band=(60,3000), n_fft=512) -> tuple[float lag, float ratio]`; `frame_level_db(x) -> float`; `class NoiseFloor(init_db=-60.0, alpha=0.02)` with `update(level_db) -> float`; `side_from_lag(lag, max_lag, deadzone=0.2) -> str`; `LAG_BIN = 0.01` (samples), `class DoaTracker(params)` with `reset()`, `frame(l, r) -> tuple[float, bool]`, `episode() -> dict(side, lag_samples, lag_ms, conf, n_valid)`; the tracker keeps a lag histogram (bin 0.01 samples over ±max_lag) and per-frame side counts instead of a frame list, so episodes of any length use bounded memory; the episode lag is the lower-median bin centre and `conf` is the share of valid frames whose own side equals the median's side; `both_sides_rule(episodes, min_conf=0.7, min_share=0.25) -> bool`.
 - Sign convention: `r[n] = l[n - d]` (signal reaches L first) gives lag `+d`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3821,6 +3821,19 @@ def test_noise_floor_adapts_up_slowly_and_down_fast():
     for _ in range(200):
         nf.update(-70.0)
     assert nf.db < -68.0  # fast decay back down
+
+
+def test_tracker_handles_long_episodes_with_a_side_change():
+    t = D.DoaTracker(D.DoaParams(spacing_m=0.06))
+    l = _burst(5)
+    left, right = (l, _delayed(l, 2.0)), (_delayed(l, 2.0), l)
+    for _ in range(3000):
+        t.frame(*left)
+    for _ in range(2500):
+        t.frame(*right)
+    ep = t.episode()
+    assert ep["n_valid"] == 5500 and ep["side"] == "left" and abs(ep["lag_samples"] - 2.0) < 0.3
+    assert abs(ep["conf"] - 3000 / 5500) < 1e-9
 
 
 def test_side_from_lag_deadzone():
@@ -3923,14 +3936,25 @@ def side_from_lag(lag: float, max_lag: int, deadzone: float = 0.2) -> str:
     return "unknown"
 
 
+LAG_BIN = 0.01  # samples; histogram resolution of the episode aggregation (parity tolerance is 0.05)
+
+
 class DoaTracker:
+    """Bounded-memory episode aggregation: a lag histogram plus per-frame side counts (mirrored in C)."""
+
     def __init__(self, params: DoaParams):
         self.p = params
         self.floor = NoiseFloor()
+        self.n_bins = int(round(2 * params.max_lag / LAG_BIN)) + 1
         self.reset()
 
     def reset(self) -> None:
-        self.lags = []
+        self.hist = np.zeros(self.n_bins, dtype=np.int64)
+        self.n_valid = 0
+        self.side_counts = {"left": 0, "right": 0, "unknown": 0}
+
+    def _bin(self, lag: float) -> int:
+        return int(min(max(math.floor((lag + self.p.max_lag) / LAG_BIN + 0.5), 0), self.n_bins - 1))
 
     def frame(self, l, r):
         level = frame_level_db(l)
@@ -3938,16 +3962,19 @@ class DoaTracker:
         lag, ratio = gcc_phat(l, r, self.p.max_lag, self.p.fs, self.p.band, self.p.n_fft)
         valid = bool(level >= floor + self.p.floor_margin_db and ratio >= self.p.min_ratio)
         if valid:
-            self.lags.append(lag)
+            self.hist[self._bin(lag)] += 1
+            self.n_valid += 1
+            self.side_counts[side_from_lag(lag, self.p.max_lag, self.p.deadzone)] += 1
         return lag, valid
 
     def episode(self) -> dict:
-        if not self.lags:
+        if self.n_valid == 0:
             return {"side": "unknown", "lag_samples": 0.0, "lag_ms": 0.0, "conf": 0.0, "n_valid": 0}
-        med = float(np.median(self.lags))
+        target = (self.n_valid - 1) // 2 + 1  # lower median
+        b = int(np.searchsorted(np.cumsum(self.hist), target))
+        med = b * LAG_BIN - self.p.max_lag
         side = side_from_lag(med, self.p.max_lag, self.p.deadzone)
-        agree = float(np.mean([side_from_lag(v, self.p.max_lag, self.p.deadzone) == side for v in self.lags]))
-        return {"side": side, "lag_samples": med, "lag_ms": med / self.p.fs * 1000.0, "conf": agree, "n_valid": len(self.lags)}
+        return {"side": side, "lag_samples": float(med), "lag_ms": float(med) / self.p.fs * 1000.0, "conf": self.side_counts[side] / self.n_valid, "n_valid": int(self.n_valid)}
 
 
 def both_sides_rule(episodes, min_conf: float = 0.7, min_share: float = 0.25) -> bool:
@@ -4281,9 +4308,10 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `claim_test_split(out_dir, manifest_sha, model_sha) -> dict | None` (records `output/v5/test_consumption.json`; returns the persisted results when the same model re-exports; raises `ExportError` when a different model asks for the same manifest's test split), `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
 - Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees. The successful `export_status.json` is written into the stage and travels inside the swap, so a live release always carries its own status; cleanup of backups and the stage after the swap is best-effort and never fails the export.
-- The exporter verifies the model version and `threshold.json`'s `model_sha256` before it reads the manifest or the test split. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
+- The exporter verifies the model version and `threshold.json`'s `model_sha256` before it reads the manifest or the test split.
+- One-time test evaluation is enforced by `output/v5/test_consumption.json` (outside the promoted trees): it stores the manifest SHA-256, the model SHA-256 and the persisted float/int8 test results. A re-export of the same model reuses the persisted results instead of re-running inference; a different model against the same manifest is refused with instructions to record the reason and delete the file deliberately. A rebuilt manifest (new SHA) starts a new record. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
 - Release gates (all must pass before anything is promoted; the threshold/model binding is checked first): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, the attempt is recorded in `export_stage/export_status.json` and `output/v5/export_last_attempt.json`, and the promoted release including its own `export_status.json` is left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
@@ -4384,6 +4412,15 @@ def _tree(d):
     return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
 
 
+def test_test_split_is_consumed_once_per_manifest(tmp_path):
+    assert X.claim_test_split(tmp_path, "m1", "modelA") is None
+    X.persist_test_results(tmp_path, {"tflite_sha256": "t", "parity": {"passed": True}, "test_metrics": {}, "robustness": {}})
+    assert X.claim_test_split(tmp_path, "m1", "modelA")["parity"]["passed"] is True  # same model: persisted results
+    with pytest.raises(X.ExportError):
+        X.claim_test_split(tmp_path, "m1", "modelB")  # another model on the same manifest
+    assert X.claim_test_split(tmp_path, "m2", "modelB") is None  # a rebuilt manifest starts a new record
+
+
 def test_promote_keeps_other_files_and_is_transactional(tmp_path, monkeypatch):
     deliv, gen = tmp_path / "deliv", tmp_path / "gen"
     deliv.mkdir()
@@ -4477,6 +4514,28 @@ def check_threshold_binding(model_path, thr: dict) -> str:
     if not expected or expected != actual:
         raise ExportError(f"threshold.json is bound to model sha256 {expected}, but {model_path} has {actual}; re-run `python -m v5.train final`")
     return actual
+
+
+def claim_test_split(out_dir, manifest_sha: str, model_sha: str):
+    """Enforce the one-time test evaluation. Returns persisted results for a repeat export of the same model."""
+    record = Path(out_dir) / "test_consumption.json"
+    if record.exists():
+        prev = json.loads(record.read_text(encoding="utf-8"))
+        if prev["manifest_sha256"] == manifest_sha:
+            if prev["model_sha256"] != model_sha:
+                raise ExportError(f"the test split of this manifest was already consumed by model {prev['model_sha256'][:12]} on {prev['at']}; "
+                                  "evaluating another model would turn the test set into a development set. If that is a deliberate decision, "
+                                  f"record the reason in the model card and delete {record} by hand.")
+            return prev.get("results")
+    record.write_text(json.dumps({"manifest_sha256": manifest_sha, "model_sha256": model_sha, "at": datetime.now().isoformat(timespec="seconds"), "results": None}, indent=1), encoding="utf-8")
+    return None
+
+
+def persist_test_results(out_dir, results: dict) -> None:
+    record = Path(out_dir) / "test_consumption.json"
+    prev = json.loads(record.read_text(encoding="utf-8"))
+    prev["results"] = results
+    record.write_text(json.dumps(prev, indent=1), encoding="utf-8")
 
 
 def precheck_release(model_path, thr: dict) -> str:
@@ -4819,7 +4878,11 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         model_sha = precheck_release(model_file, thr)  # version rule and model binding, before any manifest or test-split access
         model = keras.models.load_model(model_file, compile=False)
         check_ops(model)
+        from v5.train import file_sha256
+
         rows = M.read_manifest(out / "manifest.csv")
+        manifest_sha = file_sha256(out / "manifest.csv")
+        persisted = claim_test_split(out, manifest_sha, model_sha)  # refuses a second model; returns results for a repeat export
         _, audio, _ = M.load_cache(out)
         y = np.array([r["label"] for r in rows])
         tr, te = M.split_indices(rows, "train"), M.split_indices(rows, "test", allow_test=True)  # the single sanctioned read of the test split
@@ -4835,14 +4898,18 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         names, gx, gX, gq = G.make_golden(snore, noise, scale=valid["input_scale"], zero_point=valid["input_zero_point"])
         G.write_golden_npz(golden / "features.npz", names, gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
         G.write_golden_bin(golden / "features.bin", gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
-        Xt = precompute_features(audio[te])
-        p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
-        parity = int8_parity(p_fp, p_i8, y[te], tau)
+        if persisted is not None and persisted.get("tflite_sha256") == hashlib.sha256(tflite).hexdigest():
+            parity, test_metrics, robustness = persisted["parity"], persisted["test_metrics"], persisted["robustness"]
+        else:
+            Xt = precompute_features(audio[te])
+            p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
+            parity = int8_parity(p_fp, p_i8, y[te], tau)
+            test_metrics = {"float": clip_metrics(y[te], p_fp, tau), "int8": clip_metrics(y[te], p_i8, tau)}
+            bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd" and r["label"] == 0]]  # never snore material
+            robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
+            persist_test_results(out, {"tflite_sha256": hashlib.sha256(tflite).hexdigest(), "parity": parity, "test_metrics": test_metrics, "robustness": robustness})
         check_parity(parity)
-        test_metrics = {"float": clip_metrics(y[te], p_fp, tau), "int8": clip_metrics(y[te], p_i8, tau)}
-        bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd" and r["label"] == 0]]  # never snore material
-        robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
-        info = {"model_version": model_version, "model_sha256": model_sha, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
+        info = {"model_version": model_version, "model_sha256": model_sha, "manifest_sha256": manifest_sha, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
                 "tflite_sha256": hashlib.sha256(tflite).hexdigest(), "params": int(model.count_params()), "qp": valid, "parity": parity, "parity_limits": PARITY_LIMITS,
                 "arena": arena_estimate(model, len(tflite)), "test": test_metrics, "n_test": int(len(te)), "exported_at": datetime.now().isoformat(timespec="seconds")}
         (stage / "export_info.json").write_text(json.dumps(info, indent=1))
@@ -4876,7 +4943,10 @@ def model_card(cfg: dict) -> str:
     info = json.loads((deliv / "export_info.json").read_text())
     rob = json.loads((deliv / "robustness.json").read_text())
     cal = info.get("calib") or {}
+    consumption = Path(cfg["paths"]["out_dir"]) / "test_consumption.json"
+    consumed = json.loads(consumption.read_text()) if consumption.exists() else {}
     lines = [f"# SnoozMate v5 snore model card ({date.today().isoformat()})", "",
+             f"test split consumed once by model {consumed.get('model_sha256', '?')[:12]} on manifest {consumed.get('manifest_sha256', '?')[:12]} at {consumed.get('at', '?')}", "",
              f"model_version: `{info['model_version']}`; run `{info.get('run')}`; feature spec v{F.FEATURE_SPEC_VERSION}; tau = {info['tau']:.4f}; exported {info['exported_at']}", "",
              f"int8 TFLite: {info['tflite_bytes']} bytes (sha256 {info['tflite_sha256'][:12]}); params {info['params']}; input scale {info['qp']['input_scale']:.6f} zero point {info['qp']['input_zero_point']}; ops {info['qp'].get('ops')}", "",
              f"arena estimate: {info['arena']['activation_bytes_estimate']} bytes activations (largest tensor {info['arena']['largest_tensor_bytes']}); {info['arena']['note']}", "",
@@ -5497,7 +5567,8 @@ git commit -m "feat(fw-v5): episode state machine in C with golden-trace test"
 
 **Interfaces:**
 - Produces C API: `void doa_gcc_phat(const float *l, const float *r, int max_lag, float band_lo, float band_hi, float *lag, float *ratio);` (512-sample frames, same sign convention as Python), `typedef struct {...} doa_tracker_t; void doa_tracker_init(doa_tracker_t *t, float spacing_m); int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *lag_out); void doa_tracker_episode(const doa_tracker_t *t, doa_episode_t *out);` with `doa_episode_t { int side; float lag_samples, lag_ms, conf; int n_valid; }` and side codes 0 unknown, 1 left, 2 right.
-- Parity contract: per frame, lag within 0.05 samples and the validity decision equal; per episode, side and `n_valid` exact, `lag_samples` within 0.05, `lag_ms` within 0.05/16, `conf` within 1e-6.
+- The tracker mirrors the Python histogram aggregation: `DOA_LAG_BIN 0.01f`, `DOA_HIST_BINS = 2 * DOA_MAX_LAG_CAP / 0.01 + 1` (3201 uint32 counters, 12.8 KB) plus per-frame side counters; there is no frame cap, so episodes of any length aggregate correctly.
+- Parity contract: per frame, lag within 0.05 samples and the validity decision equal; per episode, side and `n_valid` exact, `lag_samples` within 0.05, `lag_ms` within 0.05/16, `conf` within 1e-6; the host test additionally feeds 5500 frames (3000 left, 2500 right) and checks the counts, the majority side and the lower-median lag.
 
 - [ ] **Step 1: Write the host test and extend the pytest wrapper**
 
@@ -5532,6 +5603,33 @@ static int run_cases(const char *path) {
     }
     fclose(fh);
     return failures;
+}
+
+static int run_long_episode(const char *cases_path) {
+    /* 3000 frames with the source on the left (case delay +2) then 2500 on the right (delay -2):
+     * counts must be unbounded and the lower median must stay with the majority side. */
+    FILE *fh = fopen(cases_path, "rb");
+    if (!fh) { perror("open cases"); return 1; }
+    int32_t hdr[3];
+    if (fread(hdr, sizeof(int32_t), 3, fh) != 3) return 1;
+    int16_t li[512], ri[512];
+    float expect[2], left_l[512], left_r[512], right_l[512], right_r[512];
+    for (int c = 0; c < hdr[0] && c <= 7; c++) {
+        if (fread(li, sizeof(int16_t), 512, fh) != 512 || fread(ri, sizeof(int16_t), 512, fh) != 512 || fread(expect, sizeof(float), 2, fh) != 2) return 1;
+        if (c == 1) { to_float(li, right_l); to_float(ri, right_r); }  /* delay -2: reaches R first */
+        if (c == 7) { to_float(li, left_l); to_float(ri, left_r); }    /* delay +2: reaches L first */
+    }
+    fclose(fh);
+    doa_tracker_t t;
+    doa_tracker_init(&t, 0.06f);
+    float lag_left = 0.0f, lag_right = 0.0f;
+    for (int k = 0; k < 3000; k++) doa_tracker_frame(&t, left_l, left_r, &lag_left);
+    for (int k = 0; k < 2500; k++) doa_tracker_frame(&t, right_l, right_r, &lag_right);
+    doa_episode_t ep;
+    doa_tracker_episode(&t, &ep);
+    int ok = ep.n_valid == 5500 && ep.side == 1 && fabsf(ep.lag_samples - lag_left) <= 0.05f && fabsf(ep.conf - 3000.0f / 5500.0f) <= 1e-6f;
+    printf("long episode: n_valid %d side %d lag %.3f (left frame lag %.3f, right %.3f) conf %.4f %s\n", ep.n_valid, ep.side, ep.lag_samples, lag_left, lag_right, ep.conf, ok ? "ok" : "MISMATCH");
+    return ok ? 0 : 1;
 }
 
 static int run_tracker(const char *path) {
@@ -5570,7 +5668,7 @@ static int run_tracker(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s doa_cases.bin doa_tracker.bin\n", argv[0]); return 2; }
-    int failures = run_cases(argv[1]) + run_tracker(argv[2]);
+    int failures = run_cases(argv[1]) + run_tracker(argv[2]) + run_long_episode(argv[1]);
     printf("doa parity: %d failing checks\n", failures);
     return failures ? 1 : 0;
 }
@@ -5594,16 +5692,19 @@ def test_c_fsm_and_doa_match_python(tmp_path):
 #include <stdint.h>
 
 #define DOA_MAX_LAG_CAP 16
-#define DOA_MAX_FRAMES 4096
 
 typedef struct { int side; float lag_samples, lag_ms, conf; int n_valid; } doa_episode_t;
 
+#define DOA_LAG_BIN 0.01f
+#define DOA_HIST_BINS (2 * DOA_MAX_LAG_CAP * 100 + 1)
+
 typedef struct {
     float spacing_m, c, band_lo, band_hi, deadzone, min_ratio, floor_margin_db;
-    int fs, max_lag;
+    int fs, max_lag, n_bins;
     float floor_db;
-    float lags[DOA_MAX_FRAMES];
-    int n;
+    uint32_t hist[DOA_HIST_BINS];   /* lag histogram, bin 0.01 samples over [-max_lag, +max_lag] */
+    uint32_t side_counts[3];        /* per-frame side: 0 unknown, 1 left, 2 right */
+    uint32_t n_valid;
 } doa_tracker_t;
 
 /* Positive lag: the signal reaches L first (source on the left). */
@@ -5681,7 +5782,16 @@ void doa_tracker_init(doa_tracker_t *t, float spacing_m) {
     t->spacing_m = spacing_m; t->c = 343.0f; t->fs = 16000;
     t->band_lo = 60.0f; t->band_hi = 3000.0f; t->deadzone = 0.2f; t->min_ratio = 1.5f; t->floor_margin_db = 6.0f;
     t->max_lag = (int)ceilf(spacing_m / t->c * (float)t->fs) + 1;
+    if (t->max_lag > DOA_MAX_LAG_CAP) t->max_lag = DOA_MAX_LAG_CAP;
+    t->n_bins = (int)(2.0f * (float)t->max_lag / DOA_LAG_BIN + 0.5f) + 1;
     t->floor_db = -60.0f;
+}
+
+static int lag_bin(const doa_tracker_t *t, float lag) {
+    int b = (int)floorf((lag + (float)t->max_lag) / DOA_LAG_BIN + 0.5f);
+    if (b < 0) b = 0;
+    if (b > t->n_bins - 1) b = t->n_bins - 1;
+    return b;
 }
 
 static int side_of(float lag, int max_lag, float deadzone) {
@@ -5700,30 +5810,31 @@ int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *l
     float lag, ratio;
     doa_gcc_phat(l, r, t->max_lag, t->band_lo, t->band_hi, &lag, &ratio);
     int valid = level >= t->floor_db + t->floor_margin_db && ratio >= t->min_ratio;
-    if (valid && t->n < DOA_MAX_FRAMES) t->lags[t->n++] = lag;
+    if (valid) {
+        t->hist[lag_bin(t, lag)]++;
+        t->side_counts[side_of(lag, t->max_lag, t->deadzone)]++;
+        t->n_valid++;
+    }
     if (lag_out) *lag_out = lag;
     return valid;
 }
 
-static int cmp_f(const void *a, const void *b) {
-    float x = *(const float *)a, y = *(const float *)b;
-    return (x > y) - (x < y);
-}
-
 void doa_tracker_episode(const doa_tracker_t *t, doa_episode_t *out) {
     memset(out, 0, sizeof(*out));
-    if (t->n == 0) return;
-    float sorted[DOA_MAX_FRAMES];
-    memcpy(sorted, t->lags, (size_t)t->n * sizeof(float));
-    qsort(sorted, (size_t)t->n, sizeof(float), cmp_f);
-    float med = (t->n % 2) ? sorted[t->n / 2] : 0.5f * (sorted[t->n / 2 - 1] + sorted[t->n / 2]);
-    int side = side_of(med, t->max_lag, t->deadzone), agree = 0;
-    for (int i = 0; i < t->n; i++) if (side_of(t->lags[i], t->max_lag, t->deadzone) == side) agree++;
+    if (t->n_valid == 0) return;
+    uint32_t target = (t->n_valid - 1) / 2 + 1, cum = 0; /* lower median, same as the Python reference */
+    int b = 0;
+    for (; b < t->n_bins; b++) {
+        cum += t->hist[b];
+        if (cum >= target) break;
+    }
+    float med = (float)b * DOA_LAG_BIN - (float)t->max_lag;
+    int side = side_of(med, t->max_lag, t->deadzone);
     out->side = side;
     out->lag_samples = med;
     out->lag_ms = med / (float)t->fs * 1000.0f;
-    out->conf = (float)agree / (float)t->n;
-    out->n_valid = t->n;
+    out->conf = (float)t->side_counts[side] / (float)t->n_valid;
+    out->n_valid = (int)t->n_valid;
 }
 ```
 

@@ -246,7 +246,10 @@ at 2 % FPR, precision/recall/FNR/FPR at τ, confusion matrix; plus robustness sw
 model (SNR 20/10/5/0 dB with bench MS-SNSD negative windows only; RIR at 0.5/1.0/1.5 m).
 
 Int8 parity gate (test split): ΔAUC < 0.005, decision agreement at τ ≥ 99 %, max |Δp| ≤ 0.05.
-Failure blocks the release.
+Failure blocks the release. The one-time rule is enforced: `output/v5/test_consumption.json`
+records which model (SHA-256) consumed the test split of which manifest (SHA-256) together with
+the results; a repeat export of the same model reuses those results, and a different model is
+refused unless the record is deliberately deleted and the reason documented in the model card.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
 bench-partition snore and distractor windows over beds made only from bench MS-SNSD negative files
@@ -303,9 +306,11 @@ Intervention start/stop, cooldown, budget and temperature stay in the firmware s
 - Per frame: GCC-PHAT with bins outside 60–3000 Hz zeroed; lag search within ± max lag with
   parabolic sub-sample interpolation; valid if frame RMS is ≥ 6 dB above the running noise floor
   and the PHAT peak is ≥ 1.5 × the second-highest peak outside ± 1 sample.
-- Per episode: lag = median of valid frame lags within the episode; side = left if
-  lag > +0.2 · max lag, right if < −0.2 · max lag, else unknown; `doa_conf` = fraction of valid
-  frames agreeing with the median side. Positive lag means the signal reaches L first.
+- Per episode: valid frame lags go into a histogram (0.01-sample bins over ± max lag) with
+  per-frame side counters, so episodes of any length use bounded memory; lag = lower-median bin
+  centre; side = left if lag > +0.2 · max lag, right if < −0.2 · max lag, else unknown;
+  `doa_conf` = share of valid frames whose own side equals the median side. Positive lag means
+  the signal reaches L first.
 - Both-sides rule per night: confident episodes (`doa_conf ≥ 0.7`) on both sides with each side
   holding ≥ 25 % of confident episodes → `both_sides_snoring = true`; the deck says the first
   version records but does not intervene in that case.
