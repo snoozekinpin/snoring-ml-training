@@ -38,12 +38,12 @@ snoring-ml-training/
   v5/                         python package (new)
     features.py               frozen feature spec v1 + numpy reference extractor + golden vectors
     data/sources.py           per-source decode + slicing rules
-    data/manifest.py          scan, dedup, group ids, splits -> output/v5/manifest.csv
+    data/manifest.py          scan, dedup, immutable split, invariants -> output/v5/manifest.csv
     data/augment.py           waveform augmentation (RIR bank, noise mixing, tilt, shift, gain)
     data/dataset.py           keras PyDataset producing (features, label, soft_label)
     teacher.py                optional YAMNet wrapper: soft labels + label audit
     model.py                  student CNN builder
-    train.py                  protocol A / protocol B training, selection, threshold.json
+    train.py                  training runs, validation selection, calibration -> threshold.json
     evaluate.py               clip-level metrics, robustness sweeps, int8 parity
     streaming.py              episode FSM reference implementation (mirrors C)
     nights.py                 synthetic night generator
@@ -51,7 +51,7 @@ snoring-ml-training/
     doa.py                    GCC-PHAT reference + episode aggregation
     doa_sim.py                pyroomacoustics validation sweep
     events.py                 edge_event_v1 dataclass + cloud EventIn payload converter
-    export.py                 int8 TFLite, C headers, golden vectors, model card
+    export.py                 release gates, int8 TFLite, C headers, golden vectors, model card
     recording/record_session.py   capture script
     recording/labels_template.csv
     finetune.py               domain adaptation on self-recordings
