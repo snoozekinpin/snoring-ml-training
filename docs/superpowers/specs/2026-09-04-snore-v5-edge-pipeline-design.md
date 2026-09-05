@@ -225,7 +225,9 @@ Each night = held-out MS-SNSD noise bed at −50…−30 dBFS, optional RIR, 6�
 on) with burst period 2.5–5 s and breathing gaps, plus 20–40 distractor events (speech, cough,
 door, typing, vacuum from validation-split negative windows). Ground truth = episode intervals. The pipeline runs features → model → FSM at 2 Hz.
 Metrics: episode detection rate, confirm latency (episode start → CONFIRMED), false confirms per
-hour (CONFIRMED outside any episode ± 5 s), snore-stop latency (episode end → IDLE).
+hour (CONFIRMED outside any episode ± 5 s), snore-stop latency (true episode end → the FSM's
+`active` flag drops, which is the signal the intervention loop uses; the bookkeeping
+`episode_end` event follows verify_window_seconds later and is reported separately).
 
 Provisional targets, reported not promised: detection ≥ 90 %, confirm latency ≤ confirm_seconds
 + 3 s, false confirms ≤ 0.5 per hour at SNR ≥ 5 dB. Results at all SNRs go into the model card
@@ -248,7 +250,10 @@ with probability `p`.
 - states: IDLE → ACTIVE when `active`; ACTIVE → CONFIRMED when `streak ≥ confirm_seconds` and
   `periodic` (emit `episode_start`); CONFIRMED → IDLE when `activity < τ` for
   `verify_window_seconds` (emit `episode_end` with duration, mean p over hits, burst count,
-  level in dBFS); ACTIVE → IDLE when streak returns to 0.
+  level in dBFS); ACTIVE → IDLE when streak returns to 0. The FSM also exposes `active` every
+  tick; the firmware stops vibrating as soon as `active` is false while CONFIRMED.
+- all timing is integer tick arithmetic (tick = 0.5 s; streak counted in half-ticks: +2 per
+  active tick, −1 per inactive tick) so the Python reference and the C code agree exactly.
 
 Parameter mapping to the cloud `DeviceConfig`: τ ↔ `snore_confidence_threshold`,
 confirm_seconds ↔ `snore_confirm_seconds`, verify_window_seconds ↔ `verify_window_seconds`.
