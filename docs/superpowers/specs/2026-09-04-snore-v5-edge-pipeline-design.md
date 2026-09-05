@@ -91,8 +91,8 @@ assigns; `export.py` writes them into `model_meta.h`, and the C feature code app
 `q = clamp(round(X / scale) + zero_point, -128, 127)`.
 
 Golden vectors (`output/v5/golden/features.npz` + `.bin`): 12 windows — 100 Hz sine at −20 dBFS,
-white noise at −40 dBFS, 1 kHz→100 Hz chirp, digital silence, four held-out snore clips, four
-held-out noise clips — with their expected X. Parity tolerance for the C implementation:
+white noise at −40 dBFS, 1 kHz→100 Hz chirp, digital silence, four snore clips and four noise
+clips from the Kaggle test set — with their expected X. Parity tolerance for the C implementation:
 max |ΔX| ≤ 5e-3 before quantisation; after quantisation at most ±1 LSB on ≤ 1 % of cells.
 
 ## 4. Data
@@ -106,7 +106,7 @@ max |ΔX| ≤ 5e-3 before quantisation; after quantisation at most ±1 LSB on �
 | whl_s | `dataset/whltalent/s*/` 834 raw 10 s recordings | snore | recording file | train/val |
 | whl_e | `dataset/whltalent/e*/` 1520 raw 10 s recordings | noise | recording file | train/val |
 | esc50 | `dataset/esc50/audio` 2000 × 5 s @ 44.1 kHz + `meta/esc50.csv` | category `snoring` → snore, all other categories → noise | fold 1–5 (fold 5 = val) | train/val |
-| mssnsd | `dataset/RAW/MS-SNSD/noise_train` 128 files | noise | file; category from filename prefix | train/val by file; 20 % of files held out as benchmark noise beds and never used for training or augmentation |
+| mssnsd | `dataset/RAW/MS-SNSD/noise_train` 128 files | noise | file; category from filename prefix | train/val by file; 20 % of files (seeded, 42) held out as benchmark noise beds and never used for training or augmentation |
 | wild | `Snore_Detection_Project/.../inference_audios/snore{1..6}.wav` | snore | file | sanity listing only, no metrics |
 
 Excluded on purpose: `dataset/snore/synth_*` (synthetic), the pre-sliced `dataset/snore`,
@@ -221,9 +221,9 @@ agreement at τ ≥ 99 %.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded.
 Each night = held-out MS-SNSD noise bed at −50…−30 dBFS, optional RIR, 6–12 snore episodes of
-20–120 s built from held-out WHLTalent snore windows with burst period 2.5–5 s and breathing
-gaps, plus 20–40 distractor events (speech, cough, door, typing, vacuum from held-out negative
-windows). Ground truth = episode intervals. The pipeline runs features → model → FSM at 2 Hz.
+20–120 s built from WHLTalent snore windows of the protocol B validation split (never trained
+on) with burst period 2.5–5 s and breathing gaps, plus 20–40 distractor events (speech, cough,
+door, typing, vacuum from validation-split negative windows). Ground truth = episode intervals. The pipeline runs features → model → FSM at 2 Hz.
 Metrics: episode detection rate, confirm latency (episode start → CONFIRMED), false confirms per
 hour (CONFIRMED outside any episode ± 5 s), snore-stop latency (episode end → IDLE).
 
@@ -271,7 +271,7 @@ Intervention start/stop, cooldown, budget and temperature stay in the firmware s
   version records but does not intervene in that case.
 - Validation (`doa_sim.py`): pyroomacoustics stereo rooms, d ∈ {0.04, 0.06, 0.08, 0.12} m,
   distance {0.5, 1.0, 1.5} m, SNR {0, 5, 10, 20} dB, azimuth ± 20–70°, 50 trials per cell using
-  held-out snore windows; report side accuracy per cell. Target for d = 0.06 m at 1 m and
+  Kaggle test snore windows; report side accuracy per cell. Target for d = 0.06 m at 1 m and
   SNR ≥ 5 dB: ≥ 95 %. The table is an input to the hardware interface freeze.
 
 ## 10. Edge event schema and cloud mapping
