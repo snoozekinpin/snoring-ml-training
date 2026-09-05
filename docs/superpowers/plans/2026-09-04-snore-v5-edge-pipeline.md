@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the v5 snore-detection training, evaluation, streaming and export pipeline so that a leakage-free, robust int8 model plus bit-exact C feature/FSM/DoA code can be handed to firmware.
+**Goal:** Build the v5 snore-detection training, evaluation, streaming and export pipeline so that a leakage-free, robust int8 model plus numerically verified C feature/FSM/DoA code can be handed to firmware.
 
 **Architecture:** A `v5/` Python package owns one frozen feature spec, a content-deduplicated group-split manifest over the existing datasets, waveform augmentation, a small Keras CNN (optionally distilled from YAMNet), clip and streaming evaluation, a deterministic episode state machine, a GCC-PHAT direction module, and an exporter that emits int8 TFLite plus C headers and golden vectors. `esp32_firmware/v5/` holds C99 reference implementations validated on the host against those golden vectors.
 
@@ -20,6 +20,9 @@
 - DoA sign convention: positive lag means the signal reaches the L channel first (source on the left).
 - Commit after every task with a conventional message (`feat:`, `test:`, `docs:`), no co-author trailers.
 - Datasets are large; unit tests must never read `dataset/`; tests that do are marked `@pytest.mark.dataset` and skip when the directory is absent.
+- The split is immutable: `train` / `val` (early stopping, selection) / `calib` (threshold) / `test` (the whole Kaggle set) / `bench` (MS-SNSD beds). Nothing may train on, select on, calibrate on, or build synthetic nights from `test`; the exporter evaluates it exactly once.
+- Fail closed: a missing dataset root, required source or minimum window count aborts the manifest build (`DatasetMissing`); calibration that cannot meet the FPR target aborts deployment (`CalibrationError`); export gates (int8 dtypes/shapes, operator set, parity limits) abort promotion (`ExportError`) and leave previous deliverables untouched.
+- C parity is a numerical contract, not "bit-exact": features within 5e-3 (quantised within 1 LSB, at most 1 % of cells off by one), FSM exact, DoA lag within 0.05 samples with identical validity and side.
 
 ---
 
@@ -30,19 +33,19 @@
 | `pytest.ini`, `v5/__init__.py`, `v5/config.py`, `v5/configs/default.yaml` | test config, package root, config loader |
 | `v5/features.py` | frozen feature spec, reference extractor, quantiser, golden vector builder |
 | `v5/data/sources.py` | decode, resample, peak-window slicing, per-source window iterators |
-| `v5/data/manifest.py` | cache build, exact + near dedup, protocol A/B splits, invariants, report |
+| `v5/data/manifest.py` | cache build, exact + near dedup, immutable split, invariants, minimum counts, report |
 | `v5/data/augment.py` | RIR bank, noise mixing, tilt, shift, gain, SpecAugment, `Augmenter` |
 | `v5/data/dataset.py` | Keras `PyDataset` with 1:2 balanced batches, val feature precompute |
 | `v5/model.py` | student CNN builder |
 | `v5/teacher.py` | optional YAMNet scoring, Platt calibration, label audit |
 | `v5/evaluate.py` | clip metrics, recall@FPR, robustness sweep, int8 inference and parity |
-| `v5/train.py` | training runs, selection rule, threshold, CLI |
+| `v5/train.py` | training runs, validation selection, fail-closed calibration, CLI |
 | `v5/streaming.py` | `EpisodeFsm` integer-tick reference |
 | `v5/nights.py` | synthetic night generator |
-| `v5/benchmark_nights.py` | streaming benchmark and scoring |
+| `v5/benchmark_nights.py` | streaming benchmark (float and int8), one-to-one event matching |
 | `v5/doa.py`, `v5/doa_sim.py` | GCC-PHAT reference, episode aggregation, simulation sweep |
 | `v5/events.py` | edge event dataclass, cloud `EventIn` payload |
-| `v5/export.py` | int8 TFLite, C headers, golden files, model card |
+| `v5/export.py` | release gates, staged promotion, int8 TFLite, C headers, golden files, model card |
 | `v5/recording/record_session.py`, `v5/finetune.py` | self-recording kit, fine-tune recipe |
 | `esp32_firmware/v5/*.c/.h`, `esp32_firmware/v5/host_test/*` | C99 reference code and host tests |
 | `tests/*.py` | pytest suites |
@@ -77,6 +80,8 @@ def test_default_config_loads_and_resolves():
     assert Path(cfg["paths"]["out_dir"]).is_absolute()
     assert Path(cfg["paths"]["data_dir"]) == ROOT / "dataset"
     assert cfg["model_version"] == "cnn_v5_int8"
+    assert cfg["data"]["min_counts"]["train_pos"] == 1500 and cfg["threshold"]["min_calib_neg"] == 300
+    assert cfg["data"]["whl_val_batches"] == ["000002", "100002"]
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -108,8 +113,12 @@ paths:
   raw_dir: dataset/RAW
   out_dir: output/v5
 data:
-  val_frac: 0.15
+  whl_val_batches: ["000002", "100002"]   # WHLTalent batch ids (file-name prefix) held out for validation
+  esc50_val_fold: 4
+  esc50_calib_fold: 5
   bench_frac: 0.2
+  mssnsd_val_frac: 0.15
+  mssnsd_calib_frac: 0.15
   near_dup_threshold: 0.98
   whl_snore_max_windows: 3
   whl_env_max_windows: 2
@@ -117,6 +126,14 @@ data:
   esc50_snore_max_windows: 3
   mssnsd_stride_s: 5
   mssnsd_max_windows: 40
+  min_counts:
+    train_pos: 1500
+    train_neg: 4000
+    val_pos: 100
+    val_neg: 500
+    calib_neg: 300
+    test_pos: 100
+    test_neg: 100
 augment:
   rir_bank_size: 300
   p_rir: 0.6
@@ -140,7 +157,7 @@ train:
   kd_alpha: 0.5
 threshold:
   max_fpr: 0.01
-  fallback: 0.65
+  min_calib_neg: 300
 fsm:
   tick_ms: 500
   hold_s: 6
@@ -228,14 +245,15 @@ def mini_dataset(tmp_path):
     rng = np.random.default_rng(0)
     d = tmp_path / "dataset"
     w = lambda p, x, sr=16000: (p.parent.mkdir(parents=True, exist_ok=True), sf.write(p, x, sr, subtype="PCM_16"))
-    # WHLTalent raw 10 s recordings
-    for i in range(4):
-        w(d / "whltalent" / "s1.1" / f"00000{i}-A-0-00{i}.wav", _buzz(rng, 10, f0=100 + 10 * i))
+    # WHLTalent raw 10 s recordings; the file-name prefix is the batch id used for the split
     for i in range(3):
-        w(d / "whltalent" / "e1" / f"10000{i}-B-0-00{i}.wav", _noise(rng, 10))
-    # ESC-50 at 44.1 kHz with meta
+        w(d / "whltalent" / "s1.1" / f"000000-A-0-00{i + 1}.wav", _buzz(rng, 10, f0=100 + 10 * i))
+    w(d / "whltalent" / "s3" / "000002-A-2-001.wav", _buzz(rng, 10, f0=140))
+    for sub_dir, batch in (("e1", "100000"), ("e2.1", "100001"), ("e3.1", "100002")):
+        w(d / "whltalent" / sub_dir / f"{batch}-B-0-001.wav", _noise(rng, 10))
+    # ESC-50 at 44.1 kHz with meta (folds 1 train, 4 val, 5 calib)
     meta = ["filename,fold,target,category,esc10,src_file,take"]
-    for i, (cat, tgt, fold) in enumerate([("dog", 0, 1), ("rain", 10, 2), ("snoring", 28, 5), ("vacuum_cleaner", 36, 5)]):
+    for i, (cat, tgt, fold) in enumerate([("dog", 0, 1), ("rain", 10, 4), ("snoring", 28, 5), ("vacuum_cleaner", 36, 5)]):
         name = f"{fold}-{100000 + i}-A-{tgt}.wav"
         x = _buzz(rng, 5, sr=44100) if cat == "snoring" else _noise(rng, 5, sr=44100)
         w(d / "esc50" / "audio" / name, x, 44100)
@@ -271,7 +289,6 @@ git commit -m "feat(v5): package skeleton, config loader and test fixtures"
 ```
 
 ---
-
 ### Task 2: Feature spec v1 reference extractor
 
 **Files:**
@@ -498,16 +515,15 @@ git commit -m "feat(v5): frozen feature spec v1 reference extractor"
 ```
 
 ---
-
 ### Task 3: Golden vectors for feature parity
 
 **Files:**
 - Create: `v5/golden.py`, `tests/test_golden.py`
 
 **Interfaces:**
-- Consumes: `v5.features` (`extract_int16`, `float_to_int16`, `WIN`, `SR`, `FEATURE_DIM`).
-- Produces: `GOLDEN_NAMES: list[str]` (12 names), `synth_golden_signals(seed=1) -> dict[str, np.ndarray int16]` (4 synthetic), `make_golden(snore: list[np.ndarray int16], noise: list[np.ndarray int16], seed=1) -> tuple[list[str], np.ndarray int16 (12,16000), np.ndarray float32 (12,61,30)]`, `write_golden_npz(path, names, x, X)`, `read_golden_npz(path)`, `write_golden_bin(path, x, X)`, `read_golden_bin(path) -> (x, X)`.
-- Binary format (`features.bin`): header three little-endian int32 `count, win, dim`; then per item `int16[win]` followed by `float32[dim]`.
+- Consumes: `v5.features` (`extract_int16`, `float_to_int16`, `quantize`, `WIN`, `SR`, `FEATURE_DIM`, `N_FRAMES`, `N_MELS`).
+- Produces: `GOLDEN_NAMES: list[str]` (12 names), `synth_golden_signals(seed=1) -> dict[str, np.ndarray int16]` (4 synthetic), `make_golden(snore, noise, seed=1, scale=1/127, zero_point=0) -> tuple[list[str], x int16 (12,16000), X float32 (12,61,30), q int8 (12,61,30)]`, `write_golden_npz(path, names, x, X, q, scale, zero_point)`, `read_golden_npz(path) -> (names, x, X, q, scale, zero_point)`, `write_golden_bin(path, x, X, q, scale, zero_point)`, `read_golden_bin(path) -> (x, X, q, scale, zero_point)`.
+- Binary format (`features.bin`): header little-endian int32 `count, win, dim`, float32 `scale`, int32 `zero_point`; then per item `int16[win]`, `float32[dim]`, `int8[dim]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -533,18 +549,18 @@ def test_synth_signals_have_noise_floor_and_silence():
 
 
 def test_make_golden_is_deterministic_and_roundtrips(tmp_path):
-    names, x, X = G.make_golden(_clips(1, 4, 0.1), _clips(2, 4, 0.05))
-    names2, x2, X2 = G.make_golden(_clips(1, 4, 0.1), _clips(2, 4, 0.05))
-    assert names == G.GOLDEN_NAMES and x.shape == (12, F.WIN) and X.shape == (12, 61, 30)
-    assert np.array_equal(x, x2) and np.array_equal(X, X2)
-    assert np.allclose(X[4], F.extract_int16(x[4]))
-    G.write_golden_npz(tmp_path / "f.npz", names, x, X)
-    n3, x3, X3 = G.read_golden_npz(tmp_path / "f.npz")
-    assert n3 == names and np.array_equal(x3, x) and np.array_equal(X3, X)
-    G.write_golden_bin(tmp_path / "f.bin", x, X)
-    x4, X4 = G.read_golden_bin(tmp_path / "f.bin")
-    assert np.array_equal(x4, x) and np.array_equal(X4, X)
-    assert (tmp_path / "f.bin").stat().st_size == 12 + 12 * (F.WIN * 2 + F.FEATURE_DIM * 4)
+    names, x, X, q = G.make_golden(_clips(1, 4, 0.1), _clips(2, 4, 0.05), scale=1 / 127, zero_point=0)
+    names2, x2, X2, q2 = G.make_golden(_clips(1, 4, 0.1), _clips(2, 4, 0.05), scale=1 / 127, zero_point=0)
+    assert names == G.GOLDEN_NAMES and x.shape == (12, F.WIN) and X.shape == (12, 61, 30) and q.shape == (12, 61, 30) and q.dtype == np.int8
+    assert np.array_equal(x, x2) and np.array_equal(X, X2) and np.array_equal(q, q2)
+    assert np.allclose(X[4], F.extract_int16(x[4])) and np.array_equal(q[4], F.quantize(X[4], 1 / 127, 0))
+    G.write_golden_npz(tmp_path / "f.npz", names, x, X, q, 1 / 127, 0)
+    n3, x3, X3, q3, sc, zp = G.read_golden_npz(tmp_path / "f.npz")
+    assert n3 == names and np.array_equal(x3, x) and np.array_equal(X3, X) and np.array_equal(q3, q) and sc == np.float32(1 / 127) and zp == 0
+    G.write_golden_bin(tmp_path / "f.bin", x, X, q, 1 / 127, 0)
+    x4, X4, q4, sc4, zp4 = G.read_golden_bin(tmp_path / "f.bin")
+    assert np.array_equal(x4, x) and np.array_equal(X4, X) and np.array_equal(q4, q) and zp4 == 0 and abs(sc4 - 1 / 127) < 1e-9
+    assert (tmp_path / "f.bin").stat().st_size == 20 + 12 * (F.WIN * 2 + F.FEATURE_DIM * 4 + F.FEATURE_DIM)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -555,10 +571,8 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'v5.golden'`
 - [ ] **Step 3: Implement `v5/golden.py`**
 
 ```python
-"""Golden vectors for host-side C parity tests (spec section 3)."""
+"""Golden vectors for host-side C parity tests (spec sections 3 and 11)."""
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 from scipy.signal import chirp
@@ -584,43 +598,51 @@ def synth_golden_signals(seed: int = 1) -> dict[str, np.ndarray]:
     }
 
 
-def make_golden(snore: list[np.ndarray], noise: list[np.ndarray], seed: int = 1):
+def make_golden(snore, noise, seed: int = 1, scale: float = 1.0 / 127.0, zero_point: int = 0):
     if len(snore) < 4 or len(noise) < 4:
         raise ValueError("need at least 4 snore and 4 noise clips")
     synth = synth_golden_signals(seed)
     x = [synth[n] for n in SYNTH_NAMES] + [np.asarray(c, np.int16) for c in snore[:4]] + [np.asarray(c, np.int16) for c in noise[:4]]
     x = np.stack(x)
     X = np.stack([F.extract_int16(xi) for xi in x]).astype(np.float32)
-    return list(GOLDEN_NAMES), x, X
+    q = np.stack([F.quantize(Xi, scale, zero_point) for Xi in X])
+    return list(GOLDEN_NAMES), x, X, q
 
 
-def write_golden_npz(path, names, x, X) -> None:
-    np.savez(path, names=np.array(names), x=x, X=X)
+def write_golden_npz(path, names, x, X, q, scale: float, zero_point: int) -> None:
+    np.savez(path, names=np.array(names), x=x, X=X, q=q, scale=np.float32(scale), zero_point=np.int32(zero_point))
 
 
 def read_golden_npz(path):
     d = np.load(path)
-    return [str(n) for n in d["names"]], d["x"], d["X"]
+    return [str(n) for n in d["names"]], d["x"], d["X"], d["q"], float(d["scale"]), int(d["zero_point"])
 
 
-def write_golden_bin(path, x, X) -> None:
+def write_golden_bin(path, x, X, q, scale: float, zero_point: int) -> None:
     x = np.asarray(x, np.int16)
     X = np.asarray(X, np.float32).reshape(len(x), -1)
+    q = np.asarray(q, np.int8).reshape(len(x), -1)
     with open(path, "wb") as fh:
         fh.write(np.array([len(x), x.shape[1], X.shape[1]], dtype="<i4").tobytes())
-        for xi, Xi in zip(x, X):
+        fh.write(np.array([scale], dtype="<f4").tobytes())
+        fh.write(np.array([zero_point], dtype="<i4").tobytes())
+        for xi, Xi, qi in zip(x, X, q):
             fh.write(xi.astype("<i2").tobytes())
             fh.write(Xi.astype("<f4").tobytes())
+            fh.write(qi.tobytes())
 
 
 def read_golden_bin(path):
     with open(path, "rb") as fh:
         count, win, dim = np.frombuffer(fh.read(12), dtype="<i4")
-        xs, Xs = [], []
+        scale = float(np.frombuffer(fh.read(4), dtype="<f4")[0])
+        zero_point = int(np.frombuffer(fh.read(4), dtype="<i4")[0])
+        xs, Xs, qs = [], [], []
         for _ in range(count):
             xs.append(np.frombuffer(fh.read(win * 2), dtype="<i2"))
             Xs.append(np.frombuffer(fh.read(dim * 4), dtype="<f4").reshape(F.N_FRAMES, F.N_MELS))
-    return np.stack(xs), np.stack(Xs)
+            qs.append(np.frombuffer(fh.read(dim), dtype=np.int8).reshape(F.N_FRAMES, F.N_MELS))
+    return np.stack(xs), np.stack(Xs), np.stack(qs), scale, zero_point
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -632,11 +654,8 @@ Expected: PASS
 
 ```bash
 git add v5/golden.py tests/test_golden.py
-git commit -m "feat(v5): golden vector builder and binary format"
+git commit -m "feat(v5): golden vector builder with quantised features"
 ```
-
----
-
 ### Task 4: Source decoding and window slicing
 
 **Files:**
@@ -644,7 +663,7 @@ git commit -m "feat(v5): golden vector builder and binary format"
 
 **Interfaces:**
 - Consumes: `v5.features` (`SR`, `WIN`, `float_to_int16`).
-- Produces: `SOURCE_IDS: list[str]`, `TEST_SOURCES_A: frozenset[str]`, `@dataclass(frozen=True) Window(source: str, path: str, offset: int, label: int, group: str, category: str)`, `decode(path) -> np.ndarray float32 mono 16 kHz`, `frame_rms_db(x, frame=512) -> np.ndarray`, `fit_window(x, offset) -> np.ndarray[16000]`, `centre_offset(x) -> int`, `max_rms_offset(x) -> int`, `peak_offsets(x, n_max, min_sep_s, pct=60.0) -> list[int]`, `random_offset(x, rng) -> int`, `is_digital_silence(w) -> bool`, `iter_windows(data_dir, source, rng, cfg=None, errors=None) -> Iterator[tuple[Window, np.ndarray]]`, `load_window(data_dir, w) -> np.ndarray`.
+- Produces: `SOURCE_IDS: list[str]`, `TEST_SOURCES: frozenset[str]`, `@dataclass(frozen=True) Window(source: str, path: str, offset: int, label: int, group: str, category: str)` (for WHLTalent `category` is the batch id = file-name prefix, `group` is `whl_<batch>_<stem>`), `decode(path) -> np.ndarray float32 mono 16 kHz`, `frame_rms_db(x, frame=512) -> np.ndarray`, `fit_window(x, offset) -> np.ndarray[16000]`, `centre_offset(x) -> int`, `max_rms_offset(x) -> int`, `peak_offsets(x, n_max, min_sep_s, pct=60.0) -> list[int]`, `random_offset(x, rng) -> int`, `is_digital_silence(w) -> bool`, `iter_windows(data_dir, source, rng, cfg=None, errors=None) -> Iterator[tuple[Window, np.ndarray]]`, `load_window(data_dir, w) -> np.ndarray`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -711,10 +730,11 @@ def test_esc50_labels_and_groups(mini_dataset):
     assert by_cat["dog"].label == 0 and by_cat["dog"].group == "esc50_fold1"
 
 
-def test_whl_groups_are_per_recording(mini_dataset):
+def test_whl_groups_are_per_recording_and_category_is_batch(mini_dataset):
     items = list(S.iter_windows(mini_dataset, "whl_s", np.random.default_rng(0)))
     groups = {w.group for w, _ in items}
-    assert len(groups) == 4 and all(g.startswith("whl_s1.1_") for g in groups)
+    assert len(groups) == 4 and all(g.startswith("whl_00000") for g in groups)
+    assert {w.category for w, _ in items} == {"000000", "000002"}
 
 
 def test_errors_are_collected_not_raised(mini_dataset):
@@ -753,7 +773,7 @@ import soxr
 from v5 import features as F
 
 SOURCE_IDS = ["whl_s", "whl_e", "esc50", "mssnsd", "kaggle_adria", "kaggle_jibran", "wild"]
-TEST_SOURCES_A = frozenset({"kaggle_adria", "kaggle_jibran"})
+TEST_SOURCES = frozenset({"kaggle_adria", "kaggle_jibran"})
 FRAME = 512
 
 
@@ -870,7 +890,8 @@ def iter_windows(data_dir, source: str, rng, cfg: dict | None = None, errors: li
                     offs = peak_offsets(x, cfg.get("whl_snore_max_windows", 3), 1.5)
                 else:
                     offs = [max_rms_offset(x), random_offset(x, rng)][: cfg.get("whl_env_max_windows", 2)]
-                yield from _emit(source, f, data_dir, offs, label, f"whl_{d.name}_{f.stem}", d.name, x)
+                batch = f.stem.split("-")[0]  # WHLTalent file-name prefix = batch id (used for the split)
+                yield from _emit(source, f, data_dir, offs, label, f"whl_{batch}_{f.stem}", batch, x)
     elif source == "esc50":
         meta = {}
         with open(data_dir / "esc50" / "meta" / "esc50.csv", newline="", encoding="utf-8") as fh:
@@ -937,31 +958,51 @@ git commit -m "feat(v5): source decoding and one-second window slicing"
 ```
 
 ---
-
-### Task 5: Manifest with content dedup and group splits
+### Task 5: Manifest with content dedup and an immutable split
 
 **Files:**
 - Create: `v5/data/manifest.py`, `tests/test_manifest.py`
 
 **Interfaces:**
-- Consumes: `v5.data.sources` (`iter_windows`, `SOURCE_IDS`, `TEST_SOURCES_A`), `v5.features` (`float_to_int16`, `extract_int16`).
-- Produces: `COLUMNS`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]`, `load_cache(out_dir) -> same tuple`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `assign_splits(rows, protocol: str, seed=42, val_frac=0.15, bench_frac=0.2) -> list[str]`, `enforce_cluster_rule(rows, split) -> tuple[list[str], dict[str,int]]`, `check_invariants(rows, key: str) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, key, split) -> np.ndarray[int]`.
-- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
-- Split values: `train`, `val`, `test`, `bench`, `sanity`, `drop`.
+- Consumes: `v5.data.sources` (`iter_windows`, `SOURCE_IDS`, `TEST_SOURCES`), `v5.features` (`float_to_int16`, `extract_int16`).
+- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]`, `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `enforce_cluster_rule(rows, split) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split) -> np.ndarray[int]`.
+- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/exact_dups.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
+- Split values (single `split` column): `train`, `val` (early stopping and model selection), `calib` (threshold calibration), `test` (Kaggle, used exactly once by the exporter), `bench` (MS-SNSD files reserved as benchmark noise beds), `sanity`, `drop`.
+- Split rule (deterministic, from `cfg["data"]`): WHLTalent windows whose batch id (`category`) is in `whl_val_batches` → val, others → train; ESC-50 fold `esc50_val_fold` → val, fold `esc50_calib_fold` → calib, other folds → train; MS-SNSD files: `bench_frac` → bench, then `mssnsd_val_frac` → val, `mssnsd_calib_frac` → calib, rest → train (seeded); Kaggle → test; wild → sanity. Eval windows sharing a near-duplicate cluster with a train window are dropped; clusters with conflicting labels are dropped everywhere.
+- Leakage statement (goes into the report): WHLTalent carries no subject metadata, so the split is batch-disjoint (the file-name prefix), not proven subject-disjoint; ESC-50 uses its official folds; the Kaggle test set is a separate collection never used for training, selection or calibration.
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_manifest.py`:
 ```python
 import numpy as np
+import pytest
 
 from v5 import features as F
 from v5.config import load_config
 from v5.data import manifest as M
 
+TINY_MIN = {"train_pos": 1, "train_neg": 1, "val_pos": 0, "val_neg": 0, "calib_neg": 0, "test_pos": 1, "test_neg": 1}
 
-def _rows(n, source="x", cluster=None):
-    return [{"id": i, "source": source, "path": f"p{i}", "offset": 0, "label": i % 2, "group": f"g{i}", "category": "c", "md5": str(i), "dup_cluster": (cluster[i] if cluster else i), "split_a": "", "split_b": ""} for i in range(n)]
+
+def _rows(n, source="whl_s", cluster=None, split=None, label=None):
+    return [{"id": i, "source": source, "path": f"p{i}", "offset": 0, "label": (label[i] if label else i % 2), "group": f"g{i}", "category": "c", "md5": str(i),
+             "dup_cluster": (cluster[i] if cluster else i), "split": (split[i] if split else "train")} for i in range(n)]
+
+
+def _cfg(threshold=0.999):
+    cfg = load_config()
+    cfg["data"]["near_dup_threshold"] = threshold  # synthetic clips are similar by construction
+    cfg["data"]["min_counts"] = dict(TINY_MIN)
+    return cfg
+
+
+def test_check_dataset_root_raises_when_missing(tmp_path):
+    with pytest.raises(M.DatasetMissing):
+        M.check_dataset_root(tmp_path / "nowhere")
+    (tmp_path / "whltalent").mkdir()
+    with pytest.raises(M.DatasetMissing):  # esc50 and MS-SNSD missing
+        M.check_dataset_root(tmp_path)
 
 
 def test_near_dup_clusters_joins_close_pairs():
@@ -973,55 +1014,75 @@ def test_near_dup_clusters_joins_close_pairs():
     assert ids[0] == ids[1] and ids[0] != ids[2]
 
 
-def test_enforce_cluster_rule_drops_leaky_eval_rows():
-    rows = _rows(4, cluster=[0, 0, 1, 2])
-    split = ["train", "val", "val", "test"]
+def test_enforce_cluster_rule_drops_leaks_and_conflicts():
+    rows = _rows(6, cluster=[0, 0, 1, 2, 3, 3], label=[1, 1, 0, 1, 1, 0])
+    split = ["train", "val", "val", "test", "train", "calib"]
     out, dropped = M.enforce_cluster_rule(rows, split)
-    assert out == ["train", "drop", "val", "test"] and dropped == {"x": 1}
+    assert out == ["train", "drop", "val", "test", "drop", "drop"]
+    assert dropped == {("leak", "whl_s"): 1, ("conflict", "whl_s"): 2}
 
 
-def test_check_invariants_raises_on_group_overlap():
-    rows = _rows(2)
+def test_check_invariants_rejects_train_eval_overlap():
+    for eval_split in ("val", "calib", "test", "bench"):
+        rows = _rows(2)
+        rows[1]["group"] = rows[0]["group"]
+        rows[0]["split"], rows[1]["split"] = "train", eval_split
+        with pytest.raises(AssertionError):
+            M.check_invariants(rows)
+    rows = _rows(2, split=["val", "calib"])
     rows[1]["group"] = rows[0]["group"]
-    rows[0]["split_a"], rows[1]["split_a"] = "train", "val"
-    try:
-        M.check_invariants(rows, "split_a")
-        assert False, "expected AssertionError"
-    except AssertionError:
-        pass
+    M.check_invariants(rows)  # eval partitions may share groups
+
+
+def test_check_min_counts():
+    rows = _rows(4, split=["train", "train", "test", "test"], label=[1, 0, 1, 0])
+    M.check_min_counts(rows, TINY_MIN)
+    with pytest.raises(M.DatasetMissing):
+        M.check_min_counts(rows, {**TINY_MIN, "train_pos": 2})
 
 
 def test_build_manifest_end_to_end(mini_dataset, tmp_path):
-    cfg = load_config()
-    cfg["data"]["near_dup_threshold"] = 0.999  # synthetic clips are similar by construction
-    rows = M.build_manifest(mini_dataset, tmp_path / "out", cfg, seed=42)
-    assert (tmp_path / "out" / "manifest.csv").exists() and (tmp_path / "out" / "manifest_report.md").exists()
+    rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), seed=42)
+    out = tmp_path / "out"
+    assert (out / "manifest.csv").exists() and (out / "manifest_report.md").exists()
     md5s = [r["md5"] for r in rows]
-    assert len(md5s) == len(set(md5s))  # exact dedup: jibran copy of adria removed
-    kaggle = [r for r in rows if r["source"].startswith("kaggle")]
-    assert kaggle and all(r["split_a"] == "test" for r in kaggle)
-    assert all(r["split_b"] in ("train", "val", "drop") for r in kaggle)
-    assert all(r["split_a"] == "sanity" for r in rows if r["source"] == "wild")
-    bench = [r for r in rows if r["split_a"] == "bench"]
+    assert len(md5s) == len(set(md5s))  # exact dedup: the jibran copy of adria_s_0000 is gone
+    dups = M.load_exact_dups(out)
+    assert len(dups) == 1 and dups[0]["source"] == "kaggle_jibran"
+    assert "kaggle_adria ~ kaggle_jibran" in (out / "manifest_report.md").read_text()
+    assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
+    assert all(r["split"] == "sanity" for r in rows if r["source"] == "wild")
+    whl = {r["category"]: r["split"] for r in rows if r["source"] in ("whl_s", "whl_e")}
+    assert whl["000000"] == "train" and whl["000002"] == "val" and whl["100002"] == "val"
+    esc = {r["group"]: r["split"] for r in rows if r["source"] == "esc50"}
+    assert esc["esc50_fold5"] == "calib" and esc["esc50_fold4"] == "val" and esc["esc50_fold1"] == "train"
+    bench = [r for r in rows if r["split"] == "bench"]
     assert bench and all(r["source"] == "mssnsd" for r in bench) and len({r["group"] for r in bench}) == 1
-    esc_val = [r for r in rows if r["source"] == "esc50" and r["group"] == "esc50_fold5"]
-    assert esc_val and all(r["split_a"] in ("val", "drop") for r in esc_val)
-    for key in ("split_a", "split_b"):
-        M.check_invariants(rows, key)
-    rows2 = M.read_manifest(tmp_path / "out" / "manifest.csv")
+    M.check_invariants(rows)
+    rows2 = M.read_manifest(out / "manifest.csv")
     assert rows2 == rows
-    audio, feats = M.load_cache(tmp_path / "out")[1:]
+    audio, feats = M.load_cache(out)[1:]
     assert audio.shape == (len(rows), F.WIN) and feats.shape == (len(rows), F.FEATURE_DIM)
-    tr = M.split_indices(rows, "split_a", "train")
-    assert len(tr) > 0 and all(rows[i]["split_a"] == "train" for i in tr)
+    tr = M.split_indices(rows, "train")
+    assert len(tr) > 0 and all(rows[i]["split"] == "train" for i in tr)
 
 
-def test_build_manifest_reuses_cache(mini_dataset, tmp_path):
-    cfg = load_config()
-    cfg["data"]["near_dup_threshold"] = 0.999
-    rows = M.build_manifest(mini_dataset, tmp_path / "out", cfg)
-    rows2 = M.build_manifest(mini_dataset, tmp_path / "out", cfg, reuse_cache=True)
+def test_build_manifest_reuses_cache_and_fails_on_min_counts(mini_dataset, tmp_path):
+    rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
+    rows2 = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), reuse_cache=True)
     assert rows == rows2
+    cfg = _cfg()
+    cfg["data"]["min_counts"]["train_pos"] = 10_000
+    with pytest.raises(M.DatasetMissing):
+        M.build_manifest(mini_dataset, tmp_path / "out", cfg, reuse_cache=True)
+
+
+def test_build_manifest_fails_when_required_source_missing(mini_dataset, tmp_path):
+    import shutil
+
+    shutil.rmtree(mini_dataset / "esc50")
+    with pytest.raises(M.DatasetMissing):
+        M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1032,7 +1093,7 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/data/manifest.py`**
 
 ```python
-"""Manifest: decode every window once, dedup by content, split by group (spec 4.3-4.4)."""
+"""Manifest: decode every window once, dedup by content, immutable split (spec 4.3-4.4)."""
 from __future__ import annotations
 
 import argparse
@@ -1049,35 +1110,64 @@ from v5 import features as F
 from v5.config import load_config, resolve
 from v5.data import sources as S
 
-COLUMNS = ["id", "source", "path", "offset", "label", "group", "category", "md5", "dup_cluster", "split_a", "split_b"]
+COLUMNS = ["id", "source", "path", "offset", "label", "group", "category", "md5", "dup_cluster", "split"]
 INT_COLS = {"id", "offset", "label", "dup_cluster"}
 SOURCE_PRIORITY = ["whl_s", "whl_e", "esc50", "mssnsd", "kaggle_adria", "kaggle_jibran", "wild"]
+REQUIRED_SOURCES = ("whl_s", "whl_e", "esc50", "mssnsd")
+EVAL_SPLITS = ("val", "calib", "test", "bench")
+SPLITS = ("train",) + EVAL_SPLITS + ("sanity", "drop")
+LEAKAGE_STATEMENT = (
+    "WHLTalent carries no subject metadata: the split is batch-disjoint (file-name prefix), not proven subject-disjoint. "
+    "ESC-50 uses its official folds (same-source clips share a fold). The Kaggle set is a separate collection used only as the final test."
+)
+
+
+class DatasetMissing(RuntimeError):
+    """The dataset root, a required source, or a minimum window count is missing (spec section 13)."""
+
+
+def check_dataset_root(data_dir) -> None:
+    data_dir = Path(data_dir)
+    required = {"whltalent": data_dir / "whltalent", "esc50": data_dir / "esc50" / "audio", "esc50 meta": data_dir / "esc50" / "meta" / "esc50.csv",
+                "MS-SNSD": data_dir / "RAW" / "MS-SNSD" / "noise_train"}
+    missing = [f"{k} ({p})" for k, p in required.items() if not p.exists()]
+    if not data_dir.exists():
+        raise DatasetMissing(f"dataset root {data_dir} does not exist")
+    if missing:
+        raise DatasetMissing(f"dataset root {data_dir} is incomplete; missing: {', '.join(missing)}")
 
 
 def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
+    check_dataset_root(data_dir)
     out_dir = Path(out_dir)
     (out_dir / "cache").mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    rows, audio, feats, seen, errors = [], [], [], set(), []
+    rows, audio, feats, seen, errors, exact_dups = [], [], [], {}, [], []
     for src in SOURCE_PRIORITY:
         try:
             for w, x in S.iter_windows(data_dir, src, rng, cfg.get("data", {}), errors):
                 xi = F.float_to_int16(x)
                 h = hashlib.md5(xi.tobytes()).hexdigest()
                 if h in seen:
+                    exact_dups.append({"kept_id": seen[h], "kept_source": rows[seen[h]]["source"], "source": w.source, "path": w.path, "label": w.label})
                     continue
-                seen.add(h)
+                seen[h] = len(rows)
                 rows.append({"id": len(rows), "source": w.source, "path": w.path, "offset": w.offset, "label": w.label,
-                             "group": w.group, "category": w.category, "md5": h, "dup_cluster": -1, "split_a": "", "split_b": ""})
+                             "group": w.group, "category": w.category, "md5": h, "dup_cluster": -1, "split": ""})
                 audio.append(xi)
                 feats.append(F.extract_int16(xi).ravel())
         except FileNotFoundError as exc:
-            errors.append({"path": src, "error": f"source missing: {exc}"})
-    audio = np.stack(audio) if audio else np.zeros((0, F.WIN), np.int16)
-    feats = np.stack(feats).astype(np.float32) if feats else np.zeros((0, F.FEATURE_DIM), np.float32)
+            if src in REQUIRED_SOURCES:
+                raise DatasetMissing(f"required source {src} unreadable: {exc}") from exc
+            errors.append({"path": src, "error": f"optional source missing: {exc}"})
+    if not rows:
+        raise DatasetMissing("no windows were decoded")
+    audio = np.stack(audio)
+    feats = np.stack(feats).astype(np.float32)
     np.save(out_dir / "cache" / "audio_i16.npy", audio)
     np.save(out_dir / "cache" / "feats.npy", feats)
     (out_dir / "cache" / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
+    (out_dir / "cache" / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
     with open(out_dir / "manifest_errors.csv", "w", newline="", encoding="utf-8") as fh:
         wr = csv.DictWriter(fh, fieldnames=["path", "error"])
         wr.writeheader()
@@ -1089,6 +1179,11 @@ def load_cache(out_dir):
     out_dir = Path(out_dir)
     rows = json.loads((out_dir / "cache" / "rows.json").read_text(encoding="utf-8"))
     return rows, np.load(out_dir / "cache" / "audio_i16.npy"), np.load(out_dir / "cache" / "feats.npy")
+
+
+def load_exact_dups(out_dir) -> list[dict]:
+    p = Path(out_dir) / "cache" / "exact_dups.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
 def near_dup_clusters(feats, thr: float = 0.98, block: int = 1024) -> np.ndarray:
@@ -1116,69 +1211,88 @@ def near_dup_clusters(feats, thr: float = 0.98, block: int = 1024) -> np.ndarray
     return np.unique(roots, return_inverse=True)[1].astype(int)
 
 
-def assign_splits(rows, protocol: str, seed: int = 42, val_frac: float = 0.15, bench_frac: float = 0.2) -> list[str]:
-    assert protocol in ("A", "B")
+def conflicting_clusters(rows) -> set[int]:
+    labels = defaultdict(set)
+    for r in rows:
+        labels[r["dup_cluster"]].add(r["label"])
+    return {c for c, s in labels.items() if len(s) > 1}
+
+
+def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
     rng = np.random.default_rng(seed)
-    split = [""] * len(rows)
-    grp_of = [""] * len(rows)
+    whl_val = {str(b) for b in d.get("whl_val_batches", ["000002", "100002"])}
+    esc_val, esc_calib = int(d.get("esc50_val_fold", 4)), int(d.get("esc50_calib_fold", 5))
     ms_groups = sorted({r["group"] for r in rows if r["source"] == "mssnsd"})
-    perm = rng.permutation(len(ms_groups))
-    bench = {ms_groups[i] for i in perm[: int(round(bench_frac * len(ms_groups)))]}
-    pool = defaultdict(set)
-    for i, r in enumerate(rows):
-        if r["source"] == "wild":
-            split[i] = "sanity"
-            continue
-        if r["source"] == "mssnsd" and r["group"] in bench:
-            split[i] = "bench"
-            continue
-        if r["source"] in S.TEST_SOURCES_A:
-            if protocol == "A":
-                split[i] = "test"
-                continue
-            grp, key = f"kcl{r['dup_cluster']}", "kaggle"
+    perm = [ms_groups[i] for i in rng.permutation(len(ms_groups))]
+    n_bench = int(round(float(d.get("bench_frac", 0.2)) * len(perm)))
+    rest = perm[n_bench:]
+    n_val = int(math.ceil(float(d.get("mssnsd_val_frac", 0.15)) * len(rest)))
+    n_calib = int(math.ceil(float(d.get("mssnsd_calib_frac", 0.15)) * len(rest)))
+    ms_split = {g: "bench" for g in perm[:n_bench]}
+    ms_split.update({g: "val" for g in rest[:n_val]})
+    ms_split.update({g: "calib" for g in rest[n_val: n_val + n_calib]})
+    ms_split.update({g: "train" for g in rest[n_val + n_calib:]})
+    split = []
+    for r in rows:
+        src = r["source"]
+        if src == "wild":
+            split.append("sanity")
+        elif src in S.TEST_SOURCES:
+            split.append("test")
+        elif src in ("whl_s", "whl_e"):
+            split.append("val" if r["category"] in whl_val else "train")
+        elif src == "esc50":
+            fold = int(r["group"].rsplit("fold", 1)[1])
+            split.append("val" if fold == esc_val else "calib" if fold == esc_calib else "train")
+        elif src == "mssnsd":
+            split.append(ms_split[r["group"]])
         else:
-            grp, key = r["group"], r["source"]
-        if r["source"] == "esc50":
-            split[i] = "val" if grp == "esc50_fold5" else "train"
-            continue
-        grp_of[i] = grp
-        pool[key].add(grp)
-    val_groups = set()
-    for key in sorted(pool):
-        groups = sorted(pool[key])
-        perm = rng.permutation(len(groups))
-        val_groups |= {groups[i] for i in perm[: int(math.ceil(val_frac * len(groups)))]}
-    for i in range(len(rows)):
-        if not split[i]:
-            split[i] = "val" if grp_of[i] in val_groups else "train"
+            raise ValueError(f"unknown source {src}")
     return split
 
 
 def enforce_cluster_rule(rows, split):
-    train_clusters = {r["dup_cluster"] for r, s in zip(rows, split) if s == "train"}
+    conflict = conflicting_clusters(rows)
+    train_clusters = {r["dup_cluster"] for r, s in zip(rows, split) if s == "train" and r["dup_cluster"] not in conflict}
     out, dropped = list(split), Counter()
     for i, (r, s) in enumerate(zip(rows, split)):
-        if s in ("val", "test") and r["dup_cluster"] in train_clusters:
+        if s == "sanity":
+            continue
+        if r["dup_cluster"] in conflict:
             out[i] = "drop"
-            dropped[r["source"]] += 1
+            dropped[("conflict", r["source"])] += 1
+        elif s in EVAL_SPLITS and r["dup_cluster"] in train_clusters:
+            out[i] = "drop"
+            dropped[("leak", r["source"])] += 1
     return out, dict(dropped)
 
 
-def check_invariants(rows, key: str) -> None:
+def check_invariants(rows) -> None:
     by_group, by_cluster = defaultdict(set), defaultdict(set)
     for r in rows:
-        if r[key] in ("train", "val", "test"):
-            by_group[r["group"]].add(r[key])
-            by_cluster[r["dup_cluster"]].add(r[key])
-    bad_g = [g for g, s in by_group.items() if {"train", "val"} <= s]
-    bad_c = [c for c, s in by_cluster.items() if "train" in s and (s & {"val", "test"})]
-    assert not bad_g, f"{key}: groups in train and val: {bad_g[:5]}"
-    assert not bad_c, f"{key}: clusters in train and eval: {bad_c[:5]}"
+        if r["split"] == "train" or r["split"] in EVAL_SPLITS:
+            by_group[r["group"]].add(r["split"])
+            by_cluster[r["dup_cluster"]].add(r["split"])
+    evals = set(EVAL_SPLITS)
+    bad_g = [g for g, s in by_group.items() if "train" in s and (s & evals)]
+    bad_c = [c for c, s in by_cluster.items() if "train" in s and (s & evals)]
+    assert not bad_g, f"groups shared by train and an evaluation split: {bad_g[:5]}"
+    assert not bad_c, f"near-duplicate clusters shared by train and an evaluation split: {bad_c[:5]}"
+    conflict = conflicting_clusters([r for r in rows if r["split"] != "drop"])
+    assert not conflict, f"clusters with conflicting labels survive: {sorted(conflict)[:5]}"
 
 
-def split_indices(rows, key: str, split: str) -> np.ndarray:
-    return np.array([r["id"] for r in rows if r[key] == split], dtype=int)
+def check_min_counts(rows, min_counts: dict) -> None:
+    cnt = Counter((r["split"], r["label"]) for r in rows)
+    actual = {"train_pos": cnt[("train", 1)], "train_neg": cnt[("train", 0)], "val_pos": cnt[("val", 1)], "val_neg": cnt[("val", 0)],
+              "calib_neg": cnt[("calib", 0)], "test_pos": cnt[("test", 1)], "test_neg": cnt[("test", 0)]}
+    short = {k: (actual[k], v) for k, v in min_counts.items() if actual.get(k, 0) < v}
+    if short:
+        raise DatasetMissing(f"window counts below minimum (actual, required): {short}")
+
+
+def split_indices(rows, split: str) -> np.ndarray:
+    return np.array([r["id"] for r in rows if r["split"] == split], dtype=int)
 
 
 def write_manifest(rows, path) -> None:
@@ -1194,22 +1308,29 @@ def read_manifest(path) -> list[dict]:
         return [{k: (int(v) if k in INT_COLS else v) for k, v in row.items()} for row in csv.DictReader(fh)]
 
 
-def _report(rows, dropped_a, dropped_b, n_clusters_multi, cross_pairs, path) -> None:
-    lines = ["# Manifest report", "", f"windows: {len(rows)}", f"near-duplicate clusters with >1 member: {n_clusters_multi}", ""]
-    lines.append("cross-source near-duplicate pairs (cluster shared by two sources):")
-    for (a, b), n in sorted(cross_pairs.items()):
-        lines.append(f"- {a} ~ {b}: {n}")
-    for key, dropped in (("split_a", dropped_a), ("split_b", dropped_b)):
-        lines += ["", f"## {key}", "", "| source | label | train | val | test | bench | sanity | drop |", "|---|---|---|---|---|---|---|---|"]
-        cnt = Counter((r["source"], r["label"], r[key]) for r in rows)
-        for src in SOURCE_PRIORITY:
-            for lab in (1, 0):
-                vals = [cnt[(src, lab, s)] for s in ("train", "val", "test", "bench", "sanity", "drop")]
-                if sum(vals):
-                    lines.append(f"| {src} | {lab} | " + " | ".join(str(v) for v in vals) + " |")
-        lines.append("")
-        lines.append(f"dropped by cluster rule: {dropped}")
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+def _report(rows, exact_dups, dropped, members, path) -> None:
+    exact_pairs = Counter(tuple(sorted((d["kept_source"], d["source"]))) for d in exact_dups)
+    near_pairs = Counter()
+    for srcs in members.values():
+        u = sorted(set(srcs))
+        for i in range(len(u)):
+            for j in range(i + 1, len(u)):
+                near_pairs[(u[i], u[j])] += 1
+    lines = ["# Manifest report", "", f"windows kept: {len(rows)}; exact duplicates discarded: {len(exact_dups)}",
+             f"near-duplicate clusters with more than one member: {sum(1 for m in members.values() if len(m) > 1)}", "", LEAKAGE_STATEMENT, "",
+             "exact duplicates across sources (kept ~ discarded):"]
+    lines += [f"- {a} ~ {b}: {n}" for (a, b), n in sorted(exact_pairs.items())] or ["- none"]
+    lines += ["", "near-duplicate clusters spanning two sources:"]
+    lines += [f"- {a} ~ {b}: {n}" for (a, b), n in sorted(near_pairs.items())] or ["- none"]
+    lines += ["", "| source | label | " + " | ".join(SPLITS) + " |", "|---|---|" + "---|" * len(SPLITS)]
+    cnt = Counter((r["source"], r["label"], r["split"]) for r in rows)
+    for src in SOURCE_PRIORITY:
+        for lab in (1, 0):
+            vals = [cnt[(src, lab, s)] for s in SPLITS]
+            if sum(vals):
+                lines.append(f"| {src} | {lab} | " + " | ".join(str(v) for v in vals) + " |")
+    lines += ["", f"dropped (reason, source): {dropped}", ""]
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
 def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bool = False) -> list[dict]:
@@ -1219,26 +1340,19 @@ def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bo
     else:
         rows, audio, feats = build_cache(data_dir, out_dir, cfg, seed)
     d = cfg.get("data", {})
-    clusters = near_dup_clusters(feats, d.get("near_dup_threshold", 0.98))
+    clusters = near_dup_clusters(feats, float(d.get("near_dup_threshold", 0.98)))
     for r, c in zip(rows, clusters):
         r["dup_cluster"] = int(c)
-    split_a, dropped_a = enforce_cluster_rule(rows, assign_splits(rows, "A", seed, d.get("val_frac", 0.15), d.get("bench_frac", 0.2)))
-    split_b, dropped_b = enforce_cluster_rule(rows, assign_splits(rows, "B", seed, d.get("val_frac", 0.15), d.get("bench_frac", 0.2)))
-    for r, a, b in zip(rows, split_a, split_b):
-        r["split_a"], r["split_b"] = a, b
-    check_invariants(rows, "split_a")
-    check_invariants(rows, "split_b")
+    split, dropped = enforce_cluster_rule(rows, assign_splits(rows, d, seed))
+    for r, s in zip(rows, split):
+        r["split"] = s
+    check_invariants(rows)
+    check_min_counts(rows, d.get("min_counts", {}))
     members = defaultdict(list)
     for r in rows:
         members[r["dup_cluster"]].append(r["source"])
-    cross = Counter()
-    for srcs in members.values():
-        u = sorted(set(srcs))
-        for i in range(len(u)):
-            for j in range(i + 1, len(u)):
-                cross[(u[i], u[j])] += 1
     write_manifest(rows, out_dir / "manifest.csv")
-    _report(rows, dropped_a, dropped_b, sum(1 for m in members.values() if len(m) > 1), cross, out_dir / "manifest_report.md")
+    _report(rows, load_exact_dups(out_dir), dropped, members, out_dir / "manifest_report.md")
     return rows
 
 
@@ -1265,11 +1379,8 @@ Expected: PASS
 
 ```bash
 git add v5/data/manifest.py tests/test_manifest.py
-git commit -m "feat(v5): manifest with content dedup, group splits and invariants"
+git commit -m "feat(v5): manifest with content dedup, immutable split and fail-closed checks"
 ```
-
----
-
 ### Task 6: Waveform augmentation
 
 **Files:**
@@ -1545,7 +1656,6 @@ git commit -m "feat(v5): waveform augmentation with RIR bank and noise mixing"
 ```
 
 ---
-
 ### Task 7: Keras dataset with balanced batches
 
 **Files:**
@@ -1679,7 +1789,6 @@ git commit -m "feat(v5): balanced Keras dataset with on-the-fly augmentation"
 ```
 
 ---
-
 ### Task 8: Student model
 
 **Files:**
@@ -1777,7 +1886,6 @@ git commit -m "feat(v5): student CNN builder"
 ```
 
 ---
-
 ### Task 9: Optional YAMNet teacher, Platt calibration, label audit
 
 **Files:**
@@ -1965,7 +2073,6 @@ git commit -m "feat(v5): optional YAMNet teacher with Platt calibration and labe
 ```
 
 ---
-
 ### Task 10: Clip-level evaluation and int8 inference helpers
 
 **Files:**
@@ -1973,7 +2080,7 @@ git commit -m "feat(v5): optional YAMNet teacher with Platt calibration and labe
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.data.augment` (`apply_rir`, `mix_noise`), `v5.data.dataset.precompute_features`.
-- Produces: `sigmoid(z)`, `recall_at_fpr(y, p, max_fpr=0.02) -> float`, `clip_metrics(y, p, tau) -> dict` (keys `n, n_pos, auc, recall_at_fpr2, tau, precision, recall, fnr, fpr, cm`), `predict_probs(model, X, batch=256) -> np.ndarray`, `make_distance_rirs(distance_m, n=5, seed=0) -> list[np.ndarray]`, `robustness_sweep(model, audio_i16, y, noise_i16, tau, snrs=(20,10,5,0), distances=(0.5,1.0,1.5), seed=0) -> dict`, `make_interpreter(tflite: bytes | str)`, `int8_probs(tflite, X) -> np.ndarray`, `int8_parity(p_fp, p_int8, y, tau) -> dict` (keys `delta_auc, agreement, max_abs_diff, passed`).
+- Produces: `sigmoid(z)`, `recall_at_fpr(y, p, max_fpr=0.02) -> float`, `clip_metrics(y, p, tau) -> dict` (keys `n, n_pos, auc, recall_at_fpr2, tau, precision, recall, fnr, fpr, cm`), `predict_probs(model, X, batch=256) -> np.ndarray`, `make_distance_rirs(distance_m, n=5, seed=0) -> list[np.ndarray]`, `robustness_sweep(model, audio_i16, y, noise_i16, tau, snrs=(20,10,5,0), distances=(0.5,1.0,1.5), seed=0) -> dict`, `make_interpreter(tflite: bytes | str)`, `int8_probs(tflite, X) -> np.ndarray`, `int8_parity(p_fp, p_int8, y, tau) -> dict` (keys `delta_auc, agreement, max_abs_diff, passed`; passed requires `delta_auc < 0.005`, `agreement >= 0.99` and `max_abs_diff <= 0.05`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2010,6 +2117,8 @@ def test_int8_parity_pass_and_fail():
     assert ok["passed"] and ok["agreement"] == 1.0 and ok["max_abs_diff"] < 0.002
     bad = E.int8_parity(p, 1 - p, y, 0.5)
     assert not bad["passed"]
+    drift = E.int8_parity(p, np.clip(p + 0.06, 0, 1), y, 0.5)  # decisions unchanged but probabilities drift too far
+    assert not drift["passed"] and drift["agreement"] == 1.0
 
 
 @pytest.mark.slow
@@ -2142,7 +2251,8 @@ def int8_parity(p_fp, p_int8, y, tau: float) -> dict:
     two = len(np.unique(y)) == 2
     delta = abs(roc_auc_score(y, p_fp) - roc_auc_score(y, p_int8)) if two else 0.0
     agreement = float(((p_fp >= tau) == (p_int8 >= tau)).mean())
-    return {"delta_auc": float(delta), "agreement": agreement, "max_abs_diff": float(np.abs(p_fp - p_int8).max()), "passed": bool(delta < 0.005 and agreement >= 0.99)}
+    max_abs = float(np.abs(p_fp - p_int8).max())
+    return {"delta_auc": float(delta), "agreement": agreement, "max_abs_diff": max_abs, "passed": bool(delta < 0.005 and agreement >= 0.99 and max_abs <= 0.05)}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -2158,17 +2268,17 @@ git commit -m "feat(v5): clip metrics, robustness sweep and int8 inference helpe
 ```
 
 ---
-
-### Task 11: Training runs, selection rule, threshold
+### Task 11: Training runs, selection on validation, fail-closed threshold calibration
 
 **Files:**
 - Create: `v5/train.py`, `tests/test_train.py`
 
 **Interfaces:**
 - Consumes: `v5.data.manifest` (`read_manifest`, `load_cache`, `split_indices`), `v5.data.augment`, `v5.data.dataset`, `v5.model.build_model`, `v5.evaluate`, `v5.teacher` (`read_scores`, `platt_fit`, `platt_apply`).
-- Produces: `kd_loss(y_true (B,2), logits (B,1))`, `class ValAuc(keras.callbacks.Callback)` with `.best`, `.best_epoch`, `.history`, `build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray`, `train_one(cfg, protocol, use_kd, width, epochs, name, seed=42) -> dict`, `choose_threshold(y_val, p_val, max_fpr=0.01, fallback=0.65) -> float`, `select_config(results: list[dict]) -> dict`, `run_report(out_dir) -> str` (markdown), CLI `python -m v5.train {run,select,final,report}`.
+- Produces: `make_kd_loss(alpha: float) -> callable` and `kd_loss = make_kd_loss(0.5)`, `class ValAuc(keras.callbacks.Callback)`, `build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray`, `train_one(cfg, use_kd, width, epochs, name, seed=42) -> dict`, `class CalibrationError(RuntimeError)`, `fpr_upper_bound(fp, n, conf=0.95) -> float`, `choose_threshold(y_calib, p_calib, max_fpr=0.01, min_neg=300) -> tuple[float, dict]`, `select_config(results: list[dict]) -> dict`, `run_report(out_dir) -> str`, CLI `python -m v5.train {run,select,final,report}`.
 - Files: `output/v5/runs/<name>/{model.keras,metrics.json,history.json}`, `output/v5/selection.json`, `output/v5/threshold.json`, `output/v5/deployed/{model.keras,metrics.json}`, `output/v5/deliverables/experiments.md`.
-- `threshold.json` schema: `{"tau": float, "model_version": str, "max_fpr": float, "val_fpr": float, "val_recall": float, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
+- `threshold.json` schema: `{"tau": float, "model_version": str, "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
+- Calibration contract: tau is the smallest float strictly above the largest negative score that may still pass, so at most `floor(max_fpr * n_neg)` calibration negatives score at or above tau. Fewer than `min_neg` negatives, a tau above 1.0, or zero positive recall raise `CalibrationError`; nothing is written in that case.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2177,61 +2287,82 @@ git commit -m "feat(v5): clip metrics, robustness sweep and int8 inference helpe
 import json
 
 import numpy as np
+import pytest
 
 from v5 import train as TR
 from v5.config import load_config, resolve
 from v5.data import manifest as M
 
+TINY_MIN = {"train_pos": 1, "train_neg": 1, "val_pos": 0, "val_neg": 0, "calib_neg": 0, "test_pos": 1, "test_neg": 1}
 
-def test_choose_threshold_fallback_and_selection():
+
+def test_choose_threshold_meets_fpr_and_reports_bound():
     rng = np.random.default_rng(0)
+    y = np.array([1] * 400 + [0] * 400)
+    p = np.where(y == 1, rng.uniform(0.4, 1.0, 800), rng.uniform(0.0, 0.6, 800))
+    tau, info = TR.choose_threshold(y, p, max_fpr=0.01)
+    assert 0.5 <= tau <= 0.62 and info["fp"] <= 4 and info["fpr"] <= 0.01
+    assert (p[y == 0] >= tau).mean() <= 0.01 and info["fpr_upper95"] > info["fpr"] and 0 < info["recall"] <= 1
+
+
+def test_choose_threshold_never_clips_to_a_cap():
     y = np.array([1] * 300 + [0] * 300)
-    p = np.where(y == 1, rng.uniform(0.4, 1.0, 600), rng.uniform(0.0, 0.6, 600))
-    tau = TR.choose_threshold(y, p, max_fpr=0.01)
-    assert 0.5 <= tau <= 0.62
-    assert ((p[y == 0] >= tau).mean()) <= 0.01
-    assert TR.choose_threshold(y[:250], p[:250], max_fpr=0.01, fallback=0.65) == 0.65
-    # a high-scoring negative class must push the threshold up, never be clipped to a fixed cap
-    y2 = np.array([1] * 300 + [0] * 300)
-    p2 = np.r_[np.full(300, 0.995), np.full(300, 0.98)]
-    tau2 = TR.choose_threshold(y2, p2, max_fpr=0.01)
-    assert tau2 > 0.98 and (p2[y2 == 0] >= tau2).mean() <= 0.01
-    # negatives that all score above every positive: no finite threshold works -> fallback
-    p3 = np.r_[np.full(300, 0.2), np.full(300, 0.9)]
-    assert TR.choose_threshold(y2, p3, max_fpr=0.01, fallback=0.65) == 0.65
+    p = np.r_[np.full(300, 0.995), np.full(300, 0.98)]
+    tau, info = TR.choose_threshold(y, p, max_fpr=0.01)
+    assert 0.98 < tau <= 0.995 and info["fp"] == 0 and info["recall"] == 1.0
 
 
-def test_select_config_prefers_smallest_near_best():
+def test_choose_threshold_fails_closed():
+    y = np.array([1] * 300 + [0] * 300)
+    p_ok = np.r_[np.full(300, 0.9), np.full(300, 0.1)]
+    with pytest.raises(TR.CalibrationError):  # too few negatives
+        TR.choose_threshold(y[:400], p_ok[:400], max_fpr=0.01, min_neg=300)
+    with pytest.raises(TR.CalibrationError):  # every negative outscores every positive
+        TR.choose_threshold(y, np.r_[np.full(300, 0.2), np.full(300, 0.9)], max_fpr=0.01)
+    with pytest.raises(TR.CalibrationError):  # negatives saturate at 1.0
+        TR.choose_threshold(y, np.r_[np.full(300, 1.0), np.full(300, 1.0)], max_fpr=0.01)
+
+
+def test_fpr_upper_bound_is_conservative():
+    assert TR.fpr_upper_bound(0, 300) > 0 and TR.fpr_upper_bound(0, 300) < 0.011
+    assert TR.fpr_upper_bound(3, 300) > 0.01
+
+
+def test_select_config_prefers_smallest_near_best_on_validation():
     results = [
-        {"name": "w2_kd", "params": 100_000, "kd": True, "test": {"auc": 0.990, "recall_at_fpr2": 0.95}},
-        {"name": "w1_hard", "params": 25_000, "kd": False, "test": {"auc": 0.987, "recall_at_fpr2": 0.94}},
-        {"name": "w1_kd", "params": 25_000, "kd": True, "test": {"auc": 0.988, "recall_at_fpr2": 0.945}},
-        {"name": "w0_hard", "params": 8_000, "kd": False, "test": {"auc": 0.970, "recall_at_fpr2": 0.80}},
+        {"name": "kd_w2", "params": 100_000, "kd": True, "val": {"auc": 0.990, "recall_at_fpr2": 0.95}},
+        {"name": "hard_w1", "params": 25_000, "kd": False, "val": {"auc": 0.987, "recall_at_fpr2": 0.94}},
+        {"name": "kd_w1", "params": 25_000, "kd": True, "val": {"auc": 0.988, "recall_at_fpr2": 0.945}},
+        {"name": "hard_w0", "params": 8_000, "kd": False, "val": {"auc": 0.970, "recall_at_fpr2": 0.80}},
     ]
-    assert TR.select_config(results)["name"] == "w1_hard"
+    assert TR.select_config(results)["name"] == "hard_w1"
 
 
-def test_kd_loss_reduces_to_bce_when_soft_equals_hard():
+def test_kd_loss_factory():
     import keras
 
     y = np.array([[1.0, 1.0], [0.0, 0.0]], np.float32)
+    soft = np.array([[1.0, 0.7], [0.0, 0.2]], np.float32)
     logits = np.array([[2.0], [-1.0]], np.float32)
     ref = keras.losses.BinaryCrossentropy(from_logits=True)(y[:, :1], logits)
     assert np.isclose(float(TR.kd_loss(y, logits)), float(ref), atol=1e-6)
+    assert np.isclose(float(TR.make_kd_loss(1.0)(soft, logits)), float(ref), atol=1e-6)  # alpha 1 ignores soft targets
+    assert not np.isclose(float(TR.make_kd_loss(0.5)(soft, logits)), float(ref), atol=1e-3)
 
 
 def test_train_one_smoke(mini_dataset, tmp_path):
     cfg = resolve(load_config())
     cfg["paths"]["data_dir"], cfg["paths"]["out_dir"] = str(mini_dataset), str(tmp_path / "out")
     cfg["data"]["near_dup_threshold"] = 0.999
+    cfg["data"]["min_counts"] = dict(TINY_MIN)
     cfg["augment"]["rir_bank_size"] = 2
     cfg["train"]["workers"] = 1
     M.build_manifest(cfg["paths"]["data_dir"], cfg["paths"]["out_dir"], cfg)
-    metrics = TR.train_one(cfg, protocol="A", use_kd=False, width=0.5, epochs=1, name="smoke")
+    metrics = TR.train_one(cfg, use_kd=False, width=0.5, epochs=1, name="smoke")
     assert (tmp_path / "out" / "runs" / "smoke" / "model.keras").exists()
-    assert metrics["protocol"] == "A" and "val" in metrics and "test" in metrics and metrics["kd"] is False
+    assert "val" in metrics and "test" not in metrics and metrics["kd"] is False
     saved = json.loads((tmp_path / "out" / "runs" / "smoke" / "metrics.json").read_text())
-    assert saved["name"] == "smoke"
+    assert saved["name"] == "smoke" and saved["n_train"] > 0
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2242,18 +2373,19 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/train.py`**
 
 ```python
-"""Training runs, selection rule and deployment threshold (spec section 6)."""
+"""Training runs, validation-based selection and fail-closed threshold calibration (spec section 6)."""
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import time
 from pathlib import Path
 
 import keras
 import numpy as np
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score
 
 from v5 import features as F
 from v5 import teacher as T
@@ -2267,9 +2399,21 @@ from v5.model import build_model
 _BCE = keras.losses.BinaryCrossentropy(from_logits=True)
 
 
-def kd_loss(y_true, logits):
-    """0.5 * BCE(hard) + 0.5 * BCE(soft); equals BCE(hard) when soft == hard."""
-    return 0.5 * _BCE(y_true[:, 0:1], logits) + 0.5 * _BCE(y_true[:, 1:2], logits)
+class CalibrationError(RuntimeError):
+    """Threshold calibration cannot meet the FPR target; deployment must not proceed."""
+
+
+def make_kd_loss(alpha: float):
+    """alpha * BCE(hard) + (1 - alpha) * BCE(soft). Column 0 of y_true is the hard label, column 1 the soft target."""
+
+    def kd_loss(y_true, logits):
+        return alpha * _BCE(y_true[:, 0:1], logits) + (1.0 - alpha) * _BCE(y_true[:, 1:2], logits)
+
+    kd_loss.__name__ = f"kd_loss_a{alpha:g}".replace(".", "p")
+    return kd_loss
+
+
+kd_loss = make_kd_loss(0.5)
 
 
 class ValAuc(keras.callbacks.Callback):
@@ -2316,30 +2460,30 @@ def _teacher_excluded(rows, teacher_csv) -> set[int]:
     return {i for i, (_, flag) in T.read_scores(teacher_csv).items() if flag == "snore_in_negative"}
 
 
-def train_one(cfg: dict, protocol: str, use_kd: bool, width: float, epochs: int, name: str, seed: int = 42) -> dict:
+def train_one(cfg: dict, use_kd: bool, width: float, epochs: int, name: str, seed: int = 42) -> dict:
     out = Path(cfg["paths"]["out_dir"])
     rows = M.read_manifest(out / "manifest.csv")
     _, audio, _ = M.load_cache(out)
-    key = "split_a" if protocol == "A" else "split_b"
     excluded = _teacher_excluded(rows, out / "teacher.csv")
-    tr = np.array([i for i in M.split_indices(rows, key, "train") if i not in excluded], dtype=int)
-    va = M.split_indices(rows, key, "val")
+    tr = np.array([i for i in M.split_indices(rows, "train") if i not in excluded], dtype=int)
+    va = M.split_indices(rows, "val")
     y = np.array([r["label"] for r in rows], np.float32)
     kd_note = ""
     if use_kd and not (out / "teacher.csv").exists():
         use_kd, kd_note = False, "teacher.csv missing: trained with hard labels only"
         print(f"[train] {kd_note}")
+    tcfg = cfg["train"]
+    alpha = float(tcfg.get("kd_alpha", 0.5)) if use_kd else 1.0
     soft = build_soft_targets(rows, out / "teacher.csv", tr) if use_kd else y
     rng = np.random.default_rng(seed)
     rir_bank = RirBank.load_or_generate(out / "rir_bank.npz", int(cfg["augment"]["rir_bank_size"]), seed)
     aug = Augmenter(AugmentConfig.from_dict(cfg["augment"]), audio[tr][y[tr] == 0], rir_bank, rng)
-    tcfg = cfg["train"]
     ds = TrainDataset(audio[tr], y[tr], soft[tr], aug, batch=int(tcfg["batch"]), seed=seed, workers=int(tcfg.get("workers", 8)))
     Xv, yv = precompute_features(audio[va]), y[va]
     keras.utils.set_random_seed(seed)
     model = build_model(width)
     schedule = keras.optimizers.schedules.CosineDecay(float(tcfg["lr"]), max(1, len(ds) * epochs), alpha=float(tcfg["lr_min"]) / float(tcfg["lr"]))
-    model.compile(optimizer=keras.optimizers.Adam(schedule), loss=kd_loss)
+    model.compile(optimizer=keras.optimizers.Adam(schedule), loss=make_kd_loss(alpha))
     cb = ValAuc(Xv, yv, int(tcfg["patience"]))
     t0 = time.time()
     hist = model.fit(ds, epochs=epochs, callbacks=[cb], verbose=2)
@@ -2347,52 +2491,65 @@ def train_one(cfg: dict, protocol: str, use_kd: bool, width: float, epochs: int,
     run_dir.mkdir(parents=True, exist_ok=True)
     model.save(run_dir / "model.keras")
     metrics = {
-        "name": name, "protocol": protocol, "kd": bool(use_kd), "kd_note": kd_note, "width": width, "params": int(model.count_params()),
+        "name": name, "kd": bool(use_kd), "kd_alpha": alpha, "kd_note": kd_note, "width": width, "params": int(model.count_params()),
         "epochs_run": len(cb.history), "best_epoch": cb.best_epoch, "train_seconds": round(time.time() - t0, 1),
         "n_train": int(len(tr)), "n_val": int(len(va)), "val": clip_metrics(yv, predict_probs(model, Xv), 0.5), "val_auc_history": cb.history,
     }
-    if protocol == "A":
-        te = M.split_indices(rows, key, "test")
-        metrics["test"] = clip_metrics(y[te], predict_probs(model, precompute_features(audio[te])), 0.5)
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (run_dir / "history.json").write_text(json.dumps({k: [float(v) for v in vals] for k, vals in hist.history.items()}), encoding="utf-8")
     return metrics
 
 
-def choose_threshold(y_val, p_val, max_fpr: float = 0.01, fallback: float = 0.65) -> float:
-    y, p = np.asarray(y_val).astype(int), np.asarray(p_val, dtype=np.float64)
-    if (y == 0).sum() < 200 or len(np.unique(y)) < 2:
-        return float(fallback)
-    fpr, _, thr = roc_curve(y, p)
-    ok = np.nonzero(fpr <= max_fpr + 1e-12)[0]
-    if len(ok) == 0:
-        return float(fallback)
-    tau = float(thr[ok[-1]])  # smallest threshold that still meets the FPR target
-    if not np.isfinite(tau) or tau > 1.0:  # only the "reject everything" point qualifies
-        return float(fallback)
-    return tau
+def fpr_upper_bound(fp: int, n: int, conf: float = 0.95) -> float:
+    """One-sided Clopper-Pearson upper bound on the false-positive rate."""
+    from scipy.stats import beta
+
+    if n <= 0:
+        return 1.0
+    return float(beta.ppf(conf, fp + 1, max(n - fp, 1))) if fp < n else 1.0
+
+
+def choose_threshold(y_calib, p_calib, max_fpr: float = 0.01, min_neg: int = 300):
+    y, p = np.asarray(y_calib).astype(int), np.asarray(p_calib, dtype=np.float64)
+    neg, pos = np.sort(p[y == 0]), p[y == 1]
+    n_neg = int(len(neg))
+    if n_neg < min_neg:
+        raise CalibrationError(f"need at least {min_neg} calibration negatives, have {n_neg}")
+    if len(pos) == 0:
+        raise CalibrationError("no calibration positives")
+    k = int(math.floor(max_fpr * n_neg))  # negatives allowed at or above tau
+    tau = float(np.nextafter(neg[n_neg - k - 1], np.inf))
+    if tau > 1.0:
+        raise CalibrationError("negatives saturate at probability 1.0; no threshold meets the FPR target")
+    fp = int((neg >= tau).sum())
+    recall = float((pos >= tau).mean())
+    if recall == 0.0:
+        raise CalibrationError("no calibration positive passes the FPR-constrained threshold")
+    info = {"tau": tau, "n_neg": n_neg, "n_pos": int(len(pos)), "fp": fp, "fpr": fp / n_neg, "fpr_upper95": fpr_upper_bound(fp, n_neg), "recall": recall, "max_fpr": float(max_fpr)}
+    assert info["fpr"] <= max_fpr
+    return tau, info
 
 
 def select_config(results: list[dict]) -> dict:
-    best_auc = max(r["test"]["auc"] for r in results)
-    best_rec = max(r["test"]["recall_at_fpr2"] for r in results)
-    cands = [r for r in results if r["test"]["auc"] >= best_auc - 0.005 and r["test"]["recall_at_fpr2"] >= best_rec - 0.02]
+    best_auc = max(r["val"]["auc"] for r in results)
+    best_rec = max(r["val"]["recall_at_fpr2"] for r in results)
+    cands = [r for r in results if r["val"]["auc"] >= best_auc - 0.005 and r["val"]["recall_at_fpr2"] >= best_rec - 0.02]
     return min(cands, key=lambda r: (r["params"], 1 if r["kd"] else 0))
 
 
 def run_report(out_dir) -> str:
     out = Path(out_dir)
-    lines = ["# v5 training runs", "", "| run | protocol | kd | width | params | epochs | val AUC | val R@FPR2 | test AUC | test R@FPR2 |", "|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["# v5 training runs (selection on the validation split; the test split is untouched until export)", "",
+             "| run | kd | width | params | epochs | val AUC | val R@FPR2% |", "|---|---|---|---|---|---|---|"]
     for mp in sorted(out.glob("runs/*/metrics.json")):
         m = json.loads(mp.read_text())
-        t = m.get("test", {})
-        lines.append(f"| {m['name']} | {m['protocol']} | {m['kd']} | {m['width']} | {m['params']} | {m['epochs_run']} | {m['val']['auc']:.4f} | {m['val']['recall_at_fpr2']:.3f} | {t.get('auc', float('nan')):.4f} | {t.get('recall_at_fpr2', float('nan')):.3f} |")
+        lines.append(f"| {m['name']} | {m['kd']} | {m['width']} | {m['params']} | {m['epochs_run']} | {m['val']['auc']:.4f} | {m['val']['recall_at_fpr2']:.3f} |")
     sel = out / "selection.json"
     if sel.exists():
         lines += ["", f"selected: `{json.loads(sel.read_text())['name']}`"]
     thr = out / "threshold.json"
     if thr.exists():
-        lines += ["", "threshold.json:", "```json", thr.read_text().strip(), "```"]
+        lines += ["", "threshold.json (calibrated on the calib split):", "```json", thr.read_text().strip(), "```"]
     return "\n".join(lines) + "\n"
 
 
@@ -2400,48 +2557,45 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="v5 training")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--protocol", choices=["A", "B"], required=True)
     r.add_argument("--kd", action="store_true")
     r.add_argument("--width", type=float, default=1.0)
     r.add_argument("--epochs", type=int, default=None)
     r.add_argument("--name", required=True)
     sub.add_parser("select")
-    f = sub.add_parser("final")
-    f.add_argument("--epochs", type=int, default=None)
+    sub.add_parser("final")
     sub.add_parser("report")
-    for p in (r, f):
+    for p in sub.choices.values():
         p.add_argument("--config", default=None)
     args = ap.parse_args(argv)
-    cfg = resolve(load_config(getattr(args, "config", None)))
+    cfg = resolve(load_config(args.config))
     out = Path(cfg["paths"]["out_dir"])
     if args.cmd == "run":
-        m = train_one(cfg, args.protocol, args.kd, args.width, args.epochs or int(cfg["train"]["epochs"]), args.name, cfg["seed"])
+        m = train_one(cfg, args.kd, args.width, args.epochs or int(cfg["train"]["epochs"]), args.name, cfg["seed"])
         print(json.dumps({k: m[k] for k in ("name", "params", "epochs_run", "val")}, indent=1))
-        if "test" in m:
-            print("test:", json.dumps(m["test"]))
     elif args.cmd == "select":
         results = [json.loads(p.read_text()) for p in out.glob("runs/*/metrics.json")]
-        results = [m for m in results if m["protocol"] == "A" and "test" in m]
         chosen = select_config(results)
         (out / "selection.json").write_text(json.dumps({"name": chosen["name"], "kd": chosen["kd"], "width": chosen["width"]}, indent=2))
         print("selected:", chosen["name"])
     elif args.cmd == "final":
         sel = json.loads((out / "selection.json").read_text())
-        m = train_one(cfg, "B", sel["kd"], sel["width"], args.epochs or int(cfg["train"]["epochs"]), "B_final", cfg["seed"])
+        run_dir = out / "runs" / sel["name"]
         rows = M.read_manifest(out / "manifest.csv")
         _, audio, _ = M.load_cache(out)
-        va = M.split_indices(rows, "split_b", "val")
-        model = keras.models.load_model(out / "runs" / "B_final" / "model.keras", compile=False)
-        pv = predict_probs(model, precompute_features(audio[va]))
-        yv = np.array([rows[i]["label"] for i in va])
-        tau = choose_threshold(yv, pv, float(cfg["threshold"]["max_fpr"]), float(cfg["threshold"]["fallback"]))
-        at_tau = clip_metrics(yv, pv, tau)
+        ca = M.split_indices(rows, "calib")
+        model = keras.models.load_model(run_dir / "model.keras", compile=False)
+        pc = predict_probs(model, precompute_features(audio[ca]))
+        yc = np.array([rows[i]["label"] for i in ca])
+        tau, info = choose_threshold(yc, pc, float(cfg["threshold"]["max_fpr"]), int(cfg["threshold"]["min_calib_neg"]))
+        if info["fpr"] > float(cfg["threshold"]["max_fpr"]):
+            raise CalibrationError(f"measured calibration FPR {info['fpr']:.4f} exceeds {cfg['threshold']['max_fpr']}")
         (out / "deployed").mkdir(exist_ok=True)
-        shutil.copy(out / "runs" / "B_final" / "model.keras", out / "deployed" / "model.keras")
-        m["threshold"] = at_tau
-        (out / "deployed" / "metrics.json").write_text(json.dumps(m, indent=2))
-        (out / "threshold.json").write_text(json.dumps({"tau": tau, "model_version": cfg["model_version"], "max_fpr": cfg["threshold"]["max_fpr"], "val_fpr": at_tau["fpr"], "val_recall": at_tau["recall"], "fsm": cfg["fsm"]}, indent=2))
-        print(f"deployed model with tau={tau:.3f} val_fpr={at_tau['fpr']:.4f} val_recall={at_tau['recall']:.3f}")
+        shutil.copy(run_dir / "model.keras", out / "deployed" / "model.keras")
+        run_metrics = json.loads((run_dir / "metrics.json").read_text())
+        run_metrics["calib"] = info
+        (out / "deployed" / "metrics.json").write_text(json.dumps(run_metrics, indent=2))
+        (out / "threshold.json").write_text(json.dumps({"tau": tau, "model_version": cfg["model_version"], "max_fpr": cfg["threshold"]["max_fpr"], "run": sel["name"], "calib": info, "fsm": cfg["fsm"]}, indent=2))
+        print(f"deployed {sel['name']} with tau={tau:.4f} calib_fpr={info['fpr']:.4f} (95% upper {info['fpr_upper95']:.4f}) calib_recall={info['recall']:.3f}")
     elif args.cmd == "report":
         (out / "deliverables").mkdir(parents=True, exist_ok=True)
         text = run_report(out)
@@ -2462,11 +2616,8 @@ Expected: PASS (smoke training takes under a minute)
 
 ```bash
 git add v5/train.py tests/test_train.py
-git commit -m "feat(v5): training runs, selection rule and deployment threshold"
+git commit -m "feat(v5): training runs, validation selection and fail-closed threshold calibration"
 ```
-
----
-
 ### Task 12: Build the real manifest and teacher scores (dataset run)
 
 **Files:**
@@ -2476,91 +2627,82 @@ git commit -m "feat(v5): training runs, selection rule and deployment threshold"
 - Consumes: `python -m v5.data.manifest`, `python -m v5.teacher`.
 - Produces: the manifest used by every later task.
 
-- [ ] **Step 1: Write the dataset invariant test**
+- [ ] **Step 1: Write the dataset gate test**
 
 `tests/test_manifest_dataset.py`:
 ```python
 import pytest
 
-from v5.config import ROOT
+from v5.config import ROOT, load_config
 from v5.data import manifest as M
 
 OUT = ROOT / "output" / "v5"
 
 
 @pytest.mark.dataset
-def test_real_manifest_invariants():
+def test_real_manifest_release_gate():
     path = OUT / "manifest.csv"
     if not path.exists():
-        pytest.skip("run python -m v5.data.manifest first")
+        pytest.fail("dataset is present but output/v5/manifest.csv is missing: run python -m v5.data.manifest")
     rows = M.read_manifest(path)
-    M.check_invariants(rows, "split_a")
-    M.check_invariants(rows, "split_b")
-    kaggle = [r for r in rows if r["source"].startswith("kaggle")]
-    assert all(r["split_a"] == "test" for r in kaggle)
-    pos_a = sum(1 for r in rows if r["split_a"] == "train" and r["label"] == 1)
-    neg_a = sum(1 for r in rows if r["split_a"] == "train" and r["label"] == 0)
-    assert pos_a > 1500 and neg_a > 4000
+    M.check_invariants(rows)
+    M.check_min_counts(rows, load_config()["data"]["min_counts"])
+    assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
     assert not any(r["category"] == "snoring" and r["label"] == 0 for r in rows)
+    assert {r["category"] for r in rows if r["source"] == "whl_s" and r["split"] == "val"} == {"000002"}
 ```
 
 - [ ] **Step 2: Build the manifest**
 
 Run: `.venv-mac/bin/python -m v5.data.manifest`
-Expected: prints `manifest rows: N -> .../output/v5/manifest.csv` with N around 12k–16k; `output/v5/manifest_report.md` lists cross-source pairs including `kaggle_adria ~ kaggle_jibran`.
+Expected: prints `manifest rows: N -> .../output/v5/manifest.csv` (N around 12k–16k). The report lists `kaggle_adria ~ kaggle_jibran` under both exact and near duplicates, the leakage statement, and a split table with non-zero train/val/calib/test/bench rows. A `DatasetMissing` error means a required source or a minimum count is missing; fix the data, do not lower the minimums.
 
 - [ ] **Step 3: Score with the teacher (optional, network)**
 
 Run: `.venv-mac/bin/python -m v5.teacher`
 Expected: either `[teacher] wrote .../teacher.csv; flags: {...}` or `[teacher] unavailable (...)`. Record which one happened in the commit message.
 
-- [ ] **Step 4: Run the dataset test and copy the report**
+- [ ] **Step 4: Run the gate test and copy the report**
 
-Run: `.venv-mac/bin/python -m pytest tests/test_manifest_dataset.py -v -m dataset && mkdir -p output/v5/deliverables && cp output/v5/manifest_report.md output/v5/deliverables/manifest_report.md`
+Run: `.venv-mac/bin/python -m pytest tests/test_manifest_dataset.py -v && cp output/v5/manifest_report.md output/v5/deliverables/manifest_report.md`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add tests/test_manifest_dataset.py output/v5/deliverables/manifest_report.md
-git commit -m "data(v5): real manifest built; report with dedup and split counts"
+git commit -m "data(v5): real manifest built; report with dedup, split counts and leakage statement"
 ```
-
----
-
-### Task 13: Protocol A experiments, selection, protocol B final model
+### Task 13: Training experiments, validation selection, calibration
 
 **Files:**
 - Create: `output/v5/runs/*` (untracked), `output/v5/selection.json`, `output/v5/threshold.json`, `output/v5/deployed/*` (untracked), `output/v5/deliverables/experiments.md` (tracked)
 
-- [ ] **Step 1: Run the four protocol A configurations**
+- [ ] **Step 1: Run the four configurations**
 
 Run each (15–40 minutes each on CPU):
 ```bash
-.venv-mac/bin/python -m v5.train run --protocol A --width 1.0 --name A_hard_w1
-.venv-mac/bin/python -m v5.train run --protocol A --width 1.0 --kd --name A_kd_w1
-.venv-mac/bin/python -m v5.train run --protocol A --width 2.0 --name A_hard_w2
-.venv-mac/bin/python -m v5.train run --protocol A --width 2.0 --kd --name A_kd_w2
+.venv-mac/bin/python -m v5.train run --width 1.0 --name hard_w1
+.venv-mac/bin/python -m v5.train run --width 1.0 --kd --name kd_w1
+.venv-mac/bin/python -m v5.train run --width 2.0 --name hard_w2
+.venv-mac/bin/python -m v5.train run --width 2.0 --kd --name kd_w2
 ```
-Expected: each prints val metrics and a `test:` line with AUC and recall_at_fpr2 on the Kaggle set. If the teacher file is missing, the `--kd` runs print the hard-label note and are still valid runs (they then duplicate the hard runs; keep them, the selection rule handles ties).
+Expected: each prints validation metrics (AUC and recall_at_fpr2). If the teacher file is missing, the `--kd` runs print the hard-label note and are still valid runs (they then duplicate the hard runs; the selection rule handles ties). The test split is not touched by any of these commands.
 
-- [ ] **Step 2: Select and train the final model**
+- [ ] **Step 2: Select on validation and calibrate on the calib split**
 
 Run: `.venv-mac/bin/python -m v5.train select && .venv-mac/bin/python -m v5.train final`
-Expected: `selected: <name>` then `deployed model with tau=... val_fpr<=0.01 ...`; `output/v5/threshold.json` exists and its `model_version` is `cnn_v5_int8`.
+Expected: `selected: <name>` then `deployed <name> with tau=... calib_fpr<=0.01 (95% upper ...) calib_recall=...`; `output/v5/threshold.json` exists with `model_version` `cnn_v5_int8`. A `CalibrationError` stops here by design; investigate the calib split before retrying.
 
 - [ ] **Step 3: Write the experiments report and commit**
 
 Run: `.venv-mac/bin/python -m v5.train report`
-Expected: markdown table with 5 runs (4 × A, B_final) and the threshold block.
+Expected: markdown table with 4 runs, the selected run, and the threshold block.
 
 ```bash
 git add output/v5/deliverables/experiments.md
-git commit -m "data(v5): protocol A experiments, selection and protocol B deployed model"
+git commit -m "data(v5): training experiments, validation selection and calibrated threshold"
 ```
-
----
-
 ### Task 14: Episode state machine (Python reference)
 
 **Files:**
@@ -2568,8 +2710,8 @@ git commit -m "data(v5): protocol A experiments, selection and protocol B deploy
 
 **Interfaces:**
 - Produces: `IDLE, ACTIVE, CONFIRMED` state strings; `@dataclass(frozen=True) FsmParams(tau=0.65, tick_ms=500, hold_ticks=12, confirm_ticks=20, verify_ticks=30, min_bursts=3, period_min_ticks=3, period_max_ticks=14)` with `FsmParams.from_config(tau, fsm_cfg: dict)` and `to_dict()`; `class EpisodeFsm(params)` with `reset()`, `tick(p: float, level_dbfs: float = 0.0) -> dict | None`, attributes `state`, `active`, `activity`, `tick_i`, `last_episode`; `run_sequence(p_seq, params, levels=None) -> tuple[list[dict], list[str], list[bool]]`.
-- Event dicts: `{"type": "episode_start", "tick", "t", "n_bursts"}` and `{"type": "episode_end", "tick", "t", "start_t", "duration_s", "mean_p", "n_bursts", "level_dbfs"}` where `t = tick * tick_ms / 1000` is the window start time.
-- Implementation detail shared with the C code: streak is capped at `4 * confirm_ticks` so ACTIVE returns to IDLE within `2 * confirm_s + hold_s` after sound stops.
+- Event dicts: `{"type": "episode_start", "tick", "t", "n_bursts"}` and `{"type": "episode_end", "tick", "t", "start_t", "duration_s", "mean_p", "n_bursts", "n_hits", "level_dbfs"}` where `t = tick * tick_ms / 1000` is the window start time. Episode statistics (`mean_p`, `n_hits`, `level_dbfs`) cover every hit from the first retained burst onward, including hits before confirmation.
+- Implementation details shared with the C code: streak is capped at `4 * confirm_ticks`; candidate hits are kept in a history pruned by the same age rule as burst starts (`confirm_ticks + hold_ticks`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2599,14 +2741,23 @@ def test_periodic_snoring_confirms_at_tick_19_with_three_bursts():
     assert states[18] == S.ACTIVE and states[19] == S.CONFIRMED
 
 
-def test_episode_end_and_active_flag_timing():
+def test_episode_end_active_flag_and_statistics():
     seq = periodic_pattern(5) + [0.1] * 80  # last hit at tick 34 (burst starting at 32)
-    events, states, actives = S.run_sequence(seq, S.FsmParams())
+    levels = [-30.0] * len(seq)
+    events, states, actives = S.run_sequence(seq, S.FsmParams(), levels)
     assert actives[34] and actives[46] and not actives[47]  # hold = 12 ticks after the last hit
     ends = [e for e in events if e["type"] == "episode_end"]
     assert len(ends) == 1 and ends[0]["tick"] == 76  # 47 + 30 - 1
     assert ends[0]["duration_s"] == (34 - 0 + 2) * 0.5 and ends[0]["n_bursts"] == 5
-    assert abs(ends[0]["mean_p"] - 0.9) < 1e-9 and states[76] == S.IDLE
+    assert ends[0]["n_hits"] == 15  # 5 bursts x 3 hits, including the hits before confirmation
+    assert abs(ends[0]["mean_p"] - 0.9) < 1e-9 and ends[0]["level_dbfs"] == -30.0 and states[76] == S.IDLE
+
+
+def test_pre_confirmation_hits_shape_the_mean():
+    seq = [0.7] * 3 + [0.1] * 5 + [0.7] * 3 + [0.1] * 5 + [0.95] * 3 + [0.1] * 5 + [0.95] * 3 + [0.1] * 80
+    events, _, _ = S.run_sequence(seq, S.FsmParams())
+    end = [e for e in events if e["type"] == "episode_end"][0]
+    assert end["n_hits"] == 12 and abs(end["mean_p"] - (6 * 0.7 + 6 * 0.95) / 12) < 1e-9
 
 
 def test_continuous_sound_never_confirms_and_returns_to_idle():
@@ -2694,6 +2845,7 @@ class EpisodeFsm:
         self.streak_q = 0
         self.in_burst = False
         self.burst_starts = deque()
+        self.hits = deque()  # (tick, p, level) for hits inside the retained window
         self.active = False
         self.activity = 0.0
         self.below_ticks = 0
@@ -2719,9 +2871,14 @@ class EpisodeFsm:
         burst_started = hit and not self.in_burst
         if burst_started:
             self.burst_starts.append(i)
+        if hit:
+            self.hits.append((i, float(p), float(level_dbfs)))
         self.in_burst = hit
-        while self.burst_starts and i - self.burst_starts[0] > P.confirm_ticks + P.hold_ticks:
+        max_age = P.confirm_ticks + P.hold_ticks
+        while self.burst_starts and i - self.burst_starts[0] > max_age:
             self.burst_starts.popleft()
+        while self.hits and i - self.hits[0][0] > max_age:
+            self.hits.popleft()
         if self.active:
             self.streak_q = min(self.streak_q + 2, 4 * P.confirm_ticks)
         else:
@@ -2733,10 +2890,12 @@ class EpisodeFsm:
             if self.streak_q == 0:
                 self.state = IDLE
             elif self.streak_q >= 2 * P.confirm_ticks and self._periodic():
+                first = int(self.burst_starts[0])
+                sel = [h for h in self.hits if h[0] >= first]
                 self.state = CONFIRMED
                 self.below_ticks = 0
-                self.ep = {"first_burst_tick": int(self.burst_starts[0]), "last_hit_tick": i, "n_bursts": len(self.burst_starts),
-                           "sum_p": float(p) if hit else 0.0, "n_hits": 1 if hit else 0, "sum_level": float(level_dbfs) if hit else 0.0}
+                self.ep = {"first_burst_tick": first, "last_hit_tick": sel[-1][0] if sel else i, "n_bursts": len(self.burst_starts),
+                           "sum_p": sum(h[1] for h in sel), "n_hits": len(sel), "sum_level": sum(h[2] for h in sel)}
                 event = {"type": "episode_start", "tick": i, "t": i * P.tick_ms / 1000.0, "n_bursts": self.ep["n_bursts"]}
         elif self.state == CONFIRMED:
             if hit:
@@ -2752,11 +2911,13 @@ class EpisodeFsm:
                     ep, n = self.ep, max(self.ep["n_hits"], 1)
                     duration_ticks = ep["last_hit_tick"] - ep["first_burst_tick"] + 2  # one window = 2 ticks
                     event = {"type": "episode_end", "tick": i, "t": i * P.tick_ms / 1000.0, "start_t": ep["first_burst_tick"] * P.tick_ms / 1000.0,
-                             "duration_s": duration_ticks * P.tick_ms / 1000.0, "mean_p": ep["sum_p"] / n, "n_bursts": ep["n_bursts"], "level_dbfs": ep["sum_level"] / n}
+                             "duration_s": duration_ticks * P.tick_ms / 1000.0, "mean_p": ep["sum_p"] / n, "n_bursts": ep["n_bursts"],
+                             "n_hits": ep["n_hits"], "level_dbfs": ep["sum_level"] / n}
                     self.last_episode = event
                     self.state = IDLE
                     self.streak_q = 0
                     self.burst_starts.clear()
+                    self.hits.clear()
                     self.in_burst = False
                     self.ep = None
             else:
@@ -2787,9 +2948,6 @@ Expected: PASS
 git add v5/streaming.py tests/test_streaming.py
 git commit -m "feat(v5): deterministic episode state machine reference"
 ```
-
----
-
 ### Task 15: Synthetic night generator
 
 **Files:**
@@ -2943,15 +3101,16 @@ git commit -m "feat(v5): synthetic night generator"
 ```
 
 ---
-
-### Task 16: Streaming benchmark
+### Task 16: Streaming benchmark (float and int8 paths, one-to-one event matching)
 
 **Files:**
 - Create: `v5/benchmark_nights.py`, `tests/test_benchmark.py`
 
 **Interfaces:**
-- Consumes: `v5.features`, `v5.nights`, `v5.streaming` (`EpisodeFsm`, `FsmParams`), `v5.evaluate` (`predict_probs`, `make_distance_rirs`), `v5.data.manifest`, `v5.data.sources.decode`.
-- Produces: `window_features(audio, hop=8000) -> np.ndarray (n,61,30,1)`, `tick_end_time(tick, tick_s=0.5) -> float` (= `(tick + 2) * tick_s`), `run_fsm(p_seq, params) -> tuple[list[dict], list[bool]]` (events get an extra `t_end`), `score_night(events, actives, episodes, tick_s=0.5, tol_s=5.0, duration_s=3600.0) -> dict` (keys `n_episodes, detected, detection_rate, confirm_latency_mean_s, confirm_latency_p90_s, false_confirms, false_confirms_per_hour, stop_latency_mean_s, stop_latency_p90_s, end_event_delay_mean_s`), `run_benchmark(model, params, cfg, seed=0) -> dict`, `to_markdown(result) -> str`, CLI `python -m v5.benchmark_nights`.
+- Consumes: `v5.features`, `v5.nights`, `v5.streaming` (`EpisodeFsm`, `FsmParams`), `v5.evaluate` (`predict_probs`, `int8_probs`, `make_distance_rirs`), `v5.data.manifest`, `v5.data.sources.decode`.
+- Produces: `window_features(audio, hop=8000) -> np.ndarray (n,61,30,1)`, `tick_end_time(tick, tick_s=0.5) -> float` (= `(tick + 2) * tick_s`), `run_fsm(p_seq, params) -> tuple[list[dict], list[bool]]` (events carry `t_end`), `match_events(events, episodes, tol_s) -> tuple[list[tuple[int, dict]], list[dict]]`, `score_night(events, actives, episodes, tick_s=0.5, tol_s=5.0, duration_s=3600.0) -> dict` (keys `n_episodes, detected, detection_rate, confirm_latency_mean_s, confirm_latency_p90_s, false_confirms, false_confirms_per_hour, stop_latency_mean_s, stop_latency_p90_s, end_event_delay_mean_s`), `run_benchmark(predictors: dict[str, callable], params, cfg, seed=0) -> dict`, `to_markdown(result) -> str`, CLI `python -m v5.benchmark_nights [--model ..] [--tflite ..] [--threshold ..]`.
+- Matching rule: episode_start events are processed in time order; each is assigned to the earliest unmatched episode whose window `[s - tol_s, e + tol_s]` contains the event's `t_end`; unassigned events are false confirms; unassigned episodes are misses. Latency is `max(0, t_end - s)`.
+- Night material: snore and distractor windows come from the untouched `test` split; beds from `bench` MS-SNSD files. The int8 predictor is the product path; the float predictor is reported for reference together with the tick-level decision agreement between the two.
 - Files: `output/v5/benchmark_nights.json`, `output/v5/deliverables/benchmark_nights.md`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2962,7 +3121,11 @@ import numpy as np
 
 from v5 import benchmark_nights as B
 from v5 import features as F
+from v5.config import load_config, resolve
+from v5.data import manifest as M
 from v5.streaming import FsmParams
+
+TINY_MIN = {"train_pos": 1, "train_neg": 1, "val_pos": 0, "val_neg": 0, "calib_neg": 0, "test_pos": 1, "test_neg": 1}
 
 
 def test_window_features_count():
@@ -2971,10 +3134,7 @@ def test_window_features_count():
     assert X.shape == (19, 61, 30, 1)  # 1 + (160000 - 16000) / 8000
 
 
-def test_run_fsm_and_score_on_oracle_probabilities():
-    tick_s = 0.5
-    episodes = [(60.0, 100.0), (200.0, 260.0)]
-    n_ticks = int(400 / tick_s)
+def _oracle_probs(episodes, n_ticks, tick_s=0.5):
     p = np.full(n_ticks, 0.05)
     for s, e in episodes:
         t = s
@@ -2982,8 +3142,13 @@ def test_run_fsm_and_score_on_oracle_probabilities():
             k = int(t / tick_s)
             p[k: k + 2] = 0.95
             t += 4.0
-    events, actives = B.run_fsm(p, FsmParams())
-    m = B.score_night(events, actives, episodes, tick_s=tick_s, duration_s=400.0)
+    return p
+
+
+def test_run_fsm_and_score_on_oracle_probabilities():
+    episodes = [(60.0, 100.0), (200.0, 260.0)]
+    events, actives = B.run_fsm(_oracle_probs(episodes, 800), FsmParams())
+    m = B.score_night(events, actives, episodes, tick_s=0.5, duration_s=400.0)
     assert m["n_episodes"] == 2 and m["detected"] == 2 and m["detection_rate"] == 1.0
     assert 9.0 <= m["confirm_latency_mean_s"] <= 14.0
     assert m["false_confirms"] == 0 and m["false_confirms_per_hour"] == 0.0
@@ -2991,10 +3156,33 @@ def test_run_fsm_and_score_on_oracle_probabilities():
     assert m["end_event_delay_mean_s"] > m["stop_latency_mean_s"]
 
 
-def test_false_confirm_is_counted_outside_episodes():
-    events = [{"type": "episode_start", "tick": 100, "t_end": 51.0}]
-    m = B.score_night(events, [False] * 200, [(120.0, 150.0)], duration_s=100.0)
-    assert m["false_confirms"] == 1 and m["false_confirms_per_hour"] == 36.0 and m["detected"] == 0
+def test_match_events_is_one_to_one_with_one_tolerance():
+    episodes = [(120.0, 150.0)]
+    early = {"type": "episode_start", "tick": 0, "t_end": 116.0}   # inside s - tol
+    second = {"type": "episode_start", "tick": 0, "t_end": 140.0}  # same episode, already matched
+    far = {"type": "episode_start", "tick": 0, "t_end": 51.0}
+    matches, unmatched = B.match_events([far, second, early], episodes, tol_s=5.0)
+    assert [j for j, _ in matches] == [0] and matches[0][1] is early
+    assert unmatched == [far, second]
+    m = B.score_night([far, second, early], [False] * 400, episodes, duration_s=100.0)
+    assert m["detected"] == 1 and m["false_confirms"] == 2 and m["false_confirms_per_hour"] == 72.0
+    assert m["confirm_latency_mean_s"] == 0.0  # early event clamps to zero latency
+
+
+def test_run_benchmark_with_fake_predictors(mini_dataset, tmp_path):
+    cfg = resolve(load_config())
+    cfg["paths"]["data_dir"], cfg["paths"]["out_dir"] = str(mini_dataset), str(tmp_path / "out")
+    cfg["data"]["near_dup_threshold"] = 0.999
+    cfg["data"]["min_counts"] = dict(TINY_MIN)
+    cfg["benchmark"] = {"n_nights": 2, "night_s": 90, "snrs": [10]}
+    M.build_manifest(cfg["paths"]["data_dir"], cfg["paths"]["out_dir"], cfg)
+    zeros = lambda X: np.zeros(len(X))
+    ones = lambda X: np.full(len(X), 0.9)
+    result = B.run_benchmark({"float": zeros, "int8": ones}, FsmParams(), cfg, seed=0)
+    assert set(result["by_snr"]) == {"float", "int8"} and result["by_snr"]["float"]["10"]["nights"] == 2
+    assert result["by_snr"]["float"]["10"]["false_confirms_per_hour"] == 0.0
+    assert result["agreement"]["float~int8"]["tick_decision_agreement"] == 0.0
+    assert "| 10 |" in B.to_markdown(result)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3005,7 +3193,7 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/benchmark_nights.py`**
 
 ```python
-"""Streaming benchmark: synthetic nights -> features -> model -> FSM -> product metrics (spec section 7)."""
+"""Streaming benchmark: synthetic nights -> features -> predictor -> FSM -> product metrics (spec section 7)."""
 from __future__ import annotations
 
 import argparse
@@ -3018,7 +3206,7 @@ from v5 import features as F
 from v5.config import load_config, resolve
 from v5.data import manifest as M
 from v5.data.sources import decode
-from v5.evaluate import make_distance_rirs, predict_probs
+from v5.evaluate import int8_probs, make_distance_rirs, predict_probs
 from v5.nights import NightSpec, generate_night
 from v5.streaming import EpisodeFsm, FsmParams
 
@@ -3045,6 +3233,19 @@ def run_fsm(p_seq, params: FsmParams):
     return events, actives
 
 
+def match_events(events, episodes, tol_s: float):
+    starts = sorted((ev for ev in events if ev["type"] == "episode_start"), key=lambda ev: ev["t_end"])
+    used, matches, unmatched = set(), [], []
+    for ev in starts:
+        found = next((j for j, (s, e) in enumerate(episodes) if j not in used and s - tol_s <= ev["t_end"] <= e + tol_s), None)
+        if found is None:
+            unmatched.append(ev)
+        else:
+            used.add(found)
+            matches.append((found, ev))
+    return matches, unmatched
+
+
 def _stats(values):
     if not values:
         return float("nan"), float("nan")
@@ -3052,15 +3253,14 @@ def _stats(values):
 
 
 def score_night(events, actives, episodes, tick_s: float = 0.5, tol_s: float = 5.0, duration_s: float = 3600.0) -> dict:
-    starts = [e for e in events if e["type"] == "episode_start"]
+    matches, unmatched = match_events(events, episodes, tol_s)
+    matched = dict(matches)
     ends = [e for e in events if e["type"] == "episode_end"]
-    detected, latency, stop_lat, end_delay = [], [], [], []
-    for s, e in episodes:
-        hits = [ev for ev in starts if s <= ev["t_end"] <= e + tol_s]
-        detected.append(bool(hits))
-        if not hits:
+    latency, stop_lat, end_delay = [], [], []
+    for j, (s, e) in enumerate(episodes):
+        if j not in matched:
             continue
-        latency.append(hits[0]["t_end"] - s)
+        latency.append(max(0.0, matched[j]["t_end"] - s))
         k0 = int(np.ceil(e / tick_s))
         drop = next((k for k in range(k0, len(actives)) if not actives[k]), None)
         if drop is not None:
@@ -3068,62 +3268,82 @@ def score_night(events, actives, episodes, tick_s: float = 0.5, tol_s: float = 5
         later_end = next((ev for ev in ends if ev["t_end"] >= e), None)
         if later_end is not None:
             end_delay.append(later_end["t_end"] - e)
-    false_confirms = sum(1 for ev in starts if not any(s - tol_s <= ev["t_end"] <= e + tol_s for s, e in episodes))
     lat_m, lat_p90 = _stats(latency)
     stop_m, stop_p90 = _stats(stop_lat)
     hours = duration_s / 3600.0
     return {
-        "n_episodes": len(episodes), "detected": int(sum(detected)), "detection_rate": (sum(detected) / len(episodes)) if episodes else float("nan"),
+        "n_episodes": len(episodes), "detected": len(matched), "detection_rate": (len(matched) / len(episodes)) if episodes else float("nan"),
         "confirm_latency_mean_s": lat_m, "confirm_latency_p90_s": lat_p90,
-        "false_confirms": int(false_confirms), "false_confirms_per_hour": false_confirms / hours,
+        "false_confirms": len(unmatched), "false_confirms_per_hour": len(unmatched) / hours,
         "stop_latency_mean_s": stop_m, "stop_latency_p90_s": stop_p90, "end_event_delay_mean_s": _stats(end_delay)[0],
     }
 
 
 def _bench_beds(rows, data_dir) -> list[np.ndarray]:
-    paths = sorted({r["path"] for r in rows if r["split_a"] == "bench"})
+    paths = sorted({r["path"] for r in rows if r["split"] == "bench"})
     return [decode(Path(data_dir) / p) for p in paths]
 
 
-def run_benchmark(model, params: FsmParams, cfg: dict, seed: int = 0) -> dict:
-    out = Path(cfg["paths"]["out_dir"])
-    rows = M.read_manifest(out / "manifest.csv")
-    _, audio, _ = M.load_cache(out)
-    beds = _bench_beds(rows, cfg["paths"]["data_dir"])
-    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split_b"] == "val" and r["label"] == 1]])
-    distract = F.int16_to_float(audio[[r["id"] for r in rows if r["split_b"] == "val" and r["label"] == 0]])
-    bcfg = cfg["benchmark"]
-    snrs, n_nights, night_s = list(bcfg["snrs"]), int(bcfg["n_nights"]), float(bcfg["night_s"])
-    rirs = make_distance_rirs(1.0, n=3, seed=seed)
-    rng = np.random.default_rng(seed)
-    nights = []
-    for k in range(n_nights):
-        snr = snrs[k % len(snrs)]
-        rir = rirs[k % len(rirs)] if k % 2 else None
-        spec = NightSpec(duration_s=night_s, snr_db=float(snr), bed_dbfs=float(rng.uniform(-50, -30)))
-        wave, episodes = generate_night(rng, beds, snore, distract, spec, rir)
-        p = predict_probs(model, window_features(wave))
-        events, actives = run_fsm(p, params)
-        m = score_night(events, actives, episodes, params.tick_ms / 1000.0, duration_s=night_s)
-        m.update({"night": k, "snr_db": snr, "rir": rir is not None})
-        nights.append(m)
-    by_snr = {}
+def _aggregate(nights, snrs) -> dict:
+    out = {}
     for snr in snrs:
         sub = [m for m in nights if m["snr_db"] == snr]
-        by_snr[str(snr)] = {
+        out[str(snr)] = {
             "nights": len(sub), "detection_rate": float(np.nanmean([m["detection_rate"] for m in sub])),
             "confirm_latency_mean_s": float(np.nanmean([m["confirm_latency_mean_s"] for m in sub])),
             "false_confirms_per_hour": float(np.mean([m["false_confirms_per_hour"] for m in sub])),
             "stop_latency_mean_s": float(np.nanmean([m["stop_latency_mean_s"] for m in sub])),
         }
-    return {"params": params.to_dict(), "nights": nights, "by_snr": by_snr}
+    return out
+
+
+def run_benchmark(predictors: dict, params: FsmParams, cfg: dict, seed: int = 0) -> dict:
+    out = Path(cfg["paths"]["out_dir"])
+    rows = M.read_manifest(out / "manifest.csv")
+    _, audio, _ = M.load_cache(out)
+    beds = _bench_beds(rows, cfg["paths"]["data_dir"])
+    if not beds:
+        raise RuntimeError("no bench MS-SNSD files in the manifest")
+    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 1]])
+    distract = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 0]])
+    bcfg = cfg["benchmark"]
+    snrs, n_nights, night_s = list(bcfg["snrs"]), int(bcfg["n_nights"]), float(bcfg["night_s"])
+    rirs = make_distance_rirs(1.0, n=3, seed=seed)
+    rng = np.random.default_rng(seed)
+    names = list(predictors)
+    nights = {name: [] for name in names}
+    agree_hits, agree_total, start_counts = {}, 0, {name: 0 for name in names}
+    for k in range(n_nights):
+        snr = snrs[k % len(snrs)]
+        rir = rirs[k % len(rirs)] if k % 2 else None
+        spec = NightSpec(duration_s=night_s, snr_db=float(snr), bed_dbfs=float(rng.uniform(-50, -30)))
+        wave, episodes = generate_night(rng, beds, snore, distract, spec, rir)
+        X = window_features(wave)
+        probs = {name: np.asarray(fn(X), dtype=np.float64) for name, fn in predictors.items()}
+        for name in names:
+            events, actives = run_fsm(probs[name], params)
+            m = score_night(events, actives, episodes, params.tick_ms / 1000.0, duration_s=night_s)
+            m.update({"night": k, "snr_db": snr, "rir": rir is not None})
+            nights[name].append(m)
+            start_counts[name] += sum(1 for ev in events if ev["type"] == "episode_start")
+        for a in range(len(names)):
+            for b in range(a + 1, len(names)):
+                key = f"{names[a]}~{names[b]}"
+                agree_hits[key] = agree_hits.get(key, 0) + int(((probs[names[a]] >= params.tau) == (probs[names[b]] >= params.tau)).sum())
+        agree_total += len(X)
+    agreement = {key: {"tick_decision_agreement": hits / max(agree_total, 1), "episode_starts": dict(start_counts)} for key, hits in agree_hits.items()}
+    return {"params": params.to_dict(), "nights": nights, "by_snr": {name: _aggregate(nights[name], snrs) for name in names}, "agreement": agreement}
 
 
 def to_markdown(result: dict) -> str:
-    lines = ["# Streaming benchmark (synthetic nights)", "", f"FSM params: `{json.dumps(result['params'])}`", "",
-             "| SNR dB | nights | detection | confirm latency s | false confirms / h | stop latency s |", "|---|---|---|---|---|---|"]
-    for snr, m in result["by_snr"].items():
-        lines.append(f"| {snr} | {m['nights']} | {m['detection_rate']:.3f} | {m['confirm_latency_mean_s']:.1f} | {m['false_confirms_per_hour']:.2f} | {m['stop_latency_mean_s']:.1f} |")
+    lines = ["# Streaming benchmark (synthetic nights from the test split)", "", f"FSM params: `{json.dumps(result['params'])}`", ""]
+    for name, by_snr in result["by_snr"].items():
+        lines += [f"## predictor: {name}", "", "| SNR dB | nights | detection | confirm latency s | false confirms / h | stop latency s |", "|---|---|---|---|---|---|"]
+        for snr, m in by_snr.items():
+            lines.append(f"| {snr} | {m['nights']} | {m['detection_rate']:.3f} | {m['confirm_latency_mean_s']:.1f} | {m['false_confirms_per_hour']:.2f} | {m['stop_latency_mean_s']:.1f} |")
+        lines.append("")
+    for key, a in result.get("agreement", {}).items():
+        lines.append(f"tick decision agreement {key}: {a['tick_decision_agreement']:.4f}; episode starts {a['episode_starts']}")
     return "\n".join(lines) + "\n"
 
 
@@ -3133,6 +3353,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     ap.add_argument("--model", default=None)
+    ap.add_argument("--tflite", default=None)
     ap.add_argument("--threshold", default=None)
     args = ap.parse_args(argv)
     cfg = resolve(load_config(args.config))
@@ -3140,7 +3361,9 @@ def main(argv=None) -> None:
     thr = json.loads(Path(args.threshold or out / "threshold.json").read_text())
     params = FsmParams.from_config(thr["tau"], thr["fsm"])
     model = keras.models.load_model(args.model or out / "deployed" / "model.keras", compile=False)
-    result = run_benchmark(model, params, cfg, cfg["seed"])
+    tflite = Path(args.tflite or out / "deliverables" / "snore_v5_int8.tflite").read_bytes()
+    predictors = {"float": lambda X: predict_probs(model, X), "int8": lambda X: int8_probs(tflite, X)}
+    result = run_benchmark(predictors, params, cfg, cfg["seed"])
     (out / "benchmark_nights.json").write_text(json.dumps(result, indent=1))
     (out / "deliverables").mkdir(parents=True, exist_ok=True)
     text = to_markdown(result)
@@ -3161,11 +3384,8 @@ Expected: PASS
 
 ```bash
 git add v5/benchmark_nights.py tests/test_benchmark.py
-git commit -m "feat(v5): streaming benchmark on synthetic nights"
+git commit -m "feat(v5): streaming benchmark with int8 path and one-to-one event matching"
 ```
-
----
-
 ### Task 17: GCC-PHAT direction module
 
 **Files:**
@@ -3398,7 +3618,6 @@ git commit -m "feat(v5): GCC-PHAT direction of arrival reference"
 ```
 
 ---
-
 ### Task 18: DoA simulation sweep
 
 **Files:**
@@ -3534,7 +3753,7 @@ def main(argv=None) -> None:
     out = Path(cfg["paths"]["out_dir"])
     rows = M.read_manifest(out / "manifest.csv")
     _, audio, _ = M.load_cache(out)
-    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split_a"] == "test" and r["label"] == 1]])
+    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 1]])
     result = run_sweep(snore, trials=args.trials, seed=cfg["seed"])
     (out / "doa_sim.json").write_text(json.dumps(result, indent=1))
     (out / "deliverables").mkdir(parents=True, exist_ok=True)
@@ -3558,7 +3777,6 @@ git commit -m "feat(v5): DoA simulation sweep"
 ```
 
 ---
-
 ### Task 19: Edge event schema and cloud payload
 
 **Files:**
@@ -3702,23 +3920,26 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 ```
 
 ---
-
-### Task 20: Exporter — int8 TFLite, C headers, golden files, model card
+### Task 20: Exporter with release gates — int8 TFLite, C headers, golden files, model card
 
 **Files:**
 - Create: `v5/export.py`, `tests/test_export.py`
-- Generated (tracked): `esp32_firmware/v5/generated/{feature_spec.h,mel_filterbank.h,model_meta.h,model_data.h,model_data.c}`, `output/v5/deliverables/{snore_v5_int8.tflite,model_card.md,robustness.json,golden/features.npz,golden/features.bin,golden/fsm_trace.txt,golden/doa_cases.bin}`
+- Generated (tracked): `esp32_firmware/v5/generated/{feature_spec.h,mel_filterbank.h,model_meta.h,model_data.h,model_data.c}`, `output/v5/deliverables/{snore_v5_int8.tflite,export_info.json,export_status.json,test_metrics.json,robustness.json,model_card.md,golden/features.npz,golden/features.bin,golden/fsm_trace.txt,golden/doa_cases.bin,golden/doa_tracker.bin}`
 
 **Interfaces:**
-- Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa.gcc_phat`, `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`), `v5.data.manifest`, `v5.data.dataset.precompute_features`.
-- Produces: `GEN_DIR: Path`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite: bytes) -> dict` (keys `input_scale, input_zero_point, output_scale, output_zero_point, input_shape`), `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm: FsmParams, model_version)`, `fsm_trace_sequence(seed=0) -> list[float]`, `write_golden_fsm(path, params: FsmParams, seed=0)`, `doa_golden_cases(seed=0) -> list[tuple[np.ndarray int16, np.ndarray int16]]`, `write_golden_doa(path, params: DoaParams, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm: FsmParams, doa: DoaParams)`, `export_model(cfg, model_path, threshold_path) -> dict`, `model_card(cfg, info: dict) -> str`, CLI `python -m v5.export headers` and `python -m v5.export model [--model ..] [--threshold ..]`.
-- Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then one line per tick `p state active event` with state codes IDLE=0, ACTIVE=1, CONFIRMED=2 and event codes none=0, start=1, end=2. `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[frame_len]`, `int16 r[frame_len]`, `float32 expected_lag`, `float32 expected_ratio`.
+- Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0)`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Release gates (all must pass before anything is promoted): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
+- Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_export.py`:
 ```python
+import json
+
 import numpy as np
+import pytest
 
 from v5 import export as X
 from v5 import features as F
@@ -3729,41 +3950,66 @@ from v5.streaming import FsmParams
 
 def test_headers_only_writes_all_files(tmp_path):
     X.write_headers_only(tmp_path / "gen", tmp_path / "golden", FsmParams(), DoaParams())
-    for name in ("feature_spec.h", "mel_filterbank.h"):
-        assert (tmp_path / "gen" / name).exists()
     spec = (tmp_path / "gen" / "feature_spec.h").read_text()
     assert "#define SF_N_FRAMES 61" in spec and "#define SF_NORM_DIV 40.0f" in spec
     fb = (tmp_path / "gen" / "mel_filterbank.h").read_text()
     assert "sf_mel_start[30]" in fb and "sf_mel_w[" in fb
     trace = (tmp_path / "golden" / "fsm_trace.txt").read_text().splitlines()
-    assert trace[0].split()[0] == "0.65" and len(trace) > 300 and any(line.endswith(" 1") for line in trace[1:])
-    assert (tmp_path / "golden" / "doa_cases.bin").stat().st_size > 12
+    assert trace[0].split()[0] == "0.65" and len(trace) > 300
+    rows = [line.split() for line in trace[1:]]
+    assert all(len(r) == 9 for r in rows)
+    ends = [r for r in rows if r[3] == "2"]
+    assert ends and float(ends[0][4]) > 0 and int(ends[0][7]) > 0
+    assert (tmp_path / "golden" / "doa_cases.bin").stat().st_size == 12 + 10 * (512 * 2 * 2 + 8)
+    assert (tmp_path / "golden" / "doa_tracker.bin").stat().st_size == 12 + 40 * (512 * 2 * 2 + 8) + 20
 
 
 def test_fsm_trace_avoids_exact_threshold():
-    seq = X.fsm_trace_sequence()
-    assert all(abs(v - 0.65) > 1e-9 for v in seq)
+    assert all(abs(v - 0.65) > 1e-9 for v in X.fsm_trace_sequence())
 
 
-def test_tflite_conversion_and_parity(tmp_path):
+def test_tflite_conversion_validation_and_headers(tmp_path):
     model = build_model(0.5)
     rng = np.random.default_rng(0)
     rep = rng.uniform(-1, 1, (64, F.N_FRAMES, F.N_MELS, 1)).astype(np.float32)
     tflite = X.to_tflite_int8(model, rep)
-    assert len(tflite) > 1000
-    qp = X.quant_params(tflite)
-    assert qp["input_shape"] == [1, 61, 30, 1] and qp["input_scale"] > 0
+    info = X.validate_tflite(tflite)
+    assert info["input_shape"] == [1, 61, 30, 1] and info["input_scale"] > 0
+    if info["ops_checked"]:
+        assert set(info["ops"]) <= X.ALLOWED_TFLITE_OPS
     from v5.evaluate import int8_probs, predict_probs
 
     Xt = rng.uniform(-1, 1, (16, F.N_FRAMES, F.N_MELS, 1)).astype(np.float32)
-    p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
-    assert p_i8.shape == (16,) and np.abs(p_fp - p_i8).max() < 0.1
+    assert np.abs(predict_probs(model, Xt) - int8_probs(tflite, Xt)).max() < 0.1
     X.write_c_array(tflite, "snore_v5_int8_tflite", tmp_path / "model_data.h", tmp_path / "model_data.c")
-    h, c = (tmp_path / "model_data.h").read_text(), (tmp_path / "model_data.c").read_text()
-    assert "extern const unsigned char snore_v5_int8_tflite[]" in h and f"snore_v5_int8_tflite_len = {len(tflite)}" in c
-    X.write_model_meta_h(tmp_path / "model_meta.h", qp, 0.7, FsmParams(tau=0.7), "cnn_v5_int8")
+    assert "extern const unsigned char snore_v5_int8_tflite[]" in (tmp_path / "model_data.h").read_text()
+    assert f"snore_v5_int8_tflite_len = {len(tflite)}" in (tmp_path / "model_data.c").read_text()
+    X.write_model_meta_h(tmp_path / "model_meta.h", info, 0.7, FsmParams(tau=0.7), "cnn_v5_int8")
     meta = (tmp_path / "model_meta.h").read_text()
     assert "#define SNORE_THRESHOLD 0.7" in meta and "#define FSM_CONFIRM_TICKS 20" in meta and '"cnn_v5_int8"' in meta
+    est = X.arena_estimate(model, len(tflite))
+    assert est["activation_bytes_estimate"] > 10_000 and est["flash_bytes"] == len(tflite)
+
+
+def test_gates_raise_export_error():
+    with pytest.raises(X.ExportError):
+        X.check_parity({"passed": False, "delta_auc": 0.1, "agreement": 0.5, "max_abs_diff": 0.4})
+    with pytest.raises(X.ExportError):
+        X.validate_tflite(b"not a model")
+
+
+def test_promote_moves_only_exporter_files(tmp_path):
+    stage, deliv, gen = tmp_path / "stage", tmp_path / "deliv", tmp_path / "gen"
+    (stage / "golden").mkdir(parents=True)
+    for name in X.PROMOTED_FILES:
+        (stage / name).write_text(name)
+    (stage / "golden" / "features.bin").write_bytes(b"x")
+    deliv.mkdir()
+    (deliv / "experiments.md").write_text("keep me")
+    X.promote(stage, deliv, gen)
+    assert (deliv / "experiments.md").read_text() == "keep me"
+    assert (deliv / "snore_v5_int8.tflite").exists() and (deliv / "golden" / "features.bin").exists()
+    assert (gen / "model_meta.h").exists() and not (stage / "snore_v5_int8.tflite").exists()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3774,13 +4020,15 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/export.py`**
 
 ```python
-"""Export: int8 TFLite, C headers, golden files and the model card (spec section 11)."""
+"""Export with release gates: int8 TFLite, C headers, golden files and the model card (spec section 11)."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -3789,13 +4037,22 @@ from scipy.signal import butter, sosfilt
 from v5 import features as F
 from v5 import golden as G
 from v5.config import ROOT, load_config, resolve
-from v5.doa import DoaParams, gcc_phat
+from v5.doa import DoaParams, DoaTracker, gcc_phat
 from v5.streaming import ACTIVE, CONFIRMED, IDLE, FsmParams, run_sequence
 
 GEN_DIR = ROOT / "esp32_firmware" / "v5" / "generated"
 STATE_CODE = {IDLE: 0, ACTIVE: 1, CONFIRMED: 2}
 EVENT_CODE = {None: 0, "episode_start": 1, "episode_end": 2}
+SIDE_CODE = {"unknown": 0, "left": 1, "right": 2}
 HEADER_NOTE = "// Auto-generated by v5/export.py from the frozen feature spec; do not edit by hand.\n"
+ALLOWED_TFLITE_OPS = {"CONV_2D", "MAX_POOL_2D", "MEAN", "FULLY_CONNECTED", "LOGISTIC", "RESHAPE", "QUANTIZE", "DEQUANTIZE"}
+PARITY_LIMITS = {"delta_auc": 0.005, "agreement": 0.99, "max_abs_diff": 0.05}
+HEADER_FILES = ("feature_spec.h", "mel_filterbank.h", "model_meta.h", "model_data.h", "model_data.c")
+PROMOTED_FILES = ["snore_v5_int8.tflite", "robustness.json", "export_info.json", "test_metrics.json", *HEADER_FILES]
+
+
+class ExportError(RuntimeError):
+    """A release gate failed; nothing was promoted."""
 
 
 def to_tflite_int8(model, rep_X) -> bytes:
@@ -3826,8 +4083,56 @@ def quant_params(tflite: bytes) -> dict:
     it = make_interpreter(tflite)
     it.allocate_tensors()
     i, o = it.get_input_details()[0], it.get_output_details()[0]
-    return {"input_scale": float(i["quantization"][0]), "input_zero_point": int(i["quantization"][1]),
-            "output_scale": float(o["quantization"][0]), "output_zero_point": int(o["quantization"][1]), "input_shape": [int(v) for v in i["shape"]]}
+    return {"input_scale": float(i["quantization"][0]), "input_zero_point": int(i["quantization"][1]), "output_scale": float(o["quantization"][0]),
+            "output_zero_point": int(o["quantization"][1]), "input_shape": [int(v) for v in i["shape"]], "output_shape": [int(v) for v in o["shape"]],
+            "input_dtype": np.dtype(i["dtype"]).name, "output_dtype": np.dtype(o["dtype"]).name}
+
+
+def tflite_ops(tflite: bytes):
+    from v5.evaluate import make_interpreter
+
+    try:
+        it = make_interpreter(tflite)
+        it.allocate_tensors()
+        return sorted({d["op_name"] for d in it._get_ops_details() if d["op_name"] != "DELEGATE"})
+    except Exception:
+        return None
+
+
+def validate_tflite(tflite: bytes) -> dict:
+    try:
+        qp = quant_params(tflite)
+    except Exception as exc:
+        raise ExportError(f"tflite model cannot be loaded: {type(exc).__name__}: {exc}") from exc
+    problems = []
+    if qp["input_dtype"] != "int8" or qp["output_dtype"] != "int8":
+        problems.append(f"dtypes {qp['input_dtype']}/{qp['output_dtype']} are not int8")
+    if qp["input_shape"] != [1, F.N_FRAMES, F.N_MELS, 1] or qp["output_shape"] != [1, 1]:
+        problems.append(f"shapes {qp['input_shape']} -> {qp['output_shape']}")
+    ops = tflite_ops(tflite)
+    if ops is not None:
+        extra = sorted(set(ops) - ALLOWED_TFLITE_OPS)
+        if extra:
+            problems.append(f"operators outside the TFLM-safe set: {extra}")
+    if problems:
+        raise ExportError("; ".join(problems))
+    return {**qp, "ops": ops, "ops_checked": ops is not None}
+
+
+def check_parity(parity: dict) -> None:
+    if not parity.get("passed"):
+        raise ExportError(f"int8 parity gate failed: {parity}")
+
+
+def arena_estimate(model, tflite_bytes: int) -> dict:
+    sizes = [int(np.prod(model.input_shape[1:]))]
+    for layer in model.layers:
+        shape = getattr(layer, "output", None)
+        if shape is not None and hasattr(shape, "shape") and len(shape.shape) > 1:
+            sizes.append(int(np.prod([int(d) for d in shape.shape[1:]])))
+    pairs = [a + b for a, b in zip(sizes, sizes[1:])] or sizes
+    return {"activation_bytes_estimate": int(max(pairs)) + 2048, "largest_tensor_bytes": int(max(sizes)), "flash_bytes": int(tflite_bytes),
+            "note": "int8 activations; two largest consecutive tensors plus scratch; measure the real arena on the device"}
 
 
 def write_c_array(data: bytes, name: str, h_path, c_path) -> None:
@@ -3846,9 +4151,8 @@ def write_feature_spec_h(path) -> None:
 
 
 def write_mel_filterbank_h(path) -> None:
-    sparse = F.sparse_filterbank()
     starts, lens, offs, weights = [], [], [], []
-    for start, w in sparse:
+    for start, w in F.sparse_filterbank():
         starts.append(start)
         lens.append(len(w))
         offs.append(len(weights))
@@ -3900,11 +4204,18 @@ def fsm_trace_sequence(seed: int = 0, tau: float = 0.65) -> list[float]:
 
 def write_golden_fsm(path, params: FsmParams, seed: int = 0) -> None:
     seq = fsm_trace_sequence(seed, params.tau)
-    events, states, actives = run_sequence(seq, params)
-    ev_by_tick = {e["tick"]: e["type"] for e in events}
+    levels = [-40.0 + 5.0 * np.sin(k / 7.0) for k in range(len(seq))]
+    events, states, actives = run_sequence(seq, params, levels)
+    ev_by_tick = {e["tick"]: e for e in events}
     lines = [f"{params.tau:g} {params.tick_ms} {params.hold_ticks} {params.confirm_ticks} {params.verify_ticks} {params.min_bursts} {params.period_min_ticks} {params.period_max_ticks}"]
     for k, (p, st, ac) in enumerate(zip(seq, states, actives)):
-        lines.append(f"{p:.3f} {STATE_CODE[st]} {1 if ac else 0} {EVENT_CODE[ev_by_tick.get(k)]}")
+        ev = ev_by_tick.get(k)
+        code = EVENT_CODE[ev["type"] if ev else None]
+        if ev is not None and ev["type"] == "episode_end":
+            tail = f"{ev['duration_s']:.3f} {ev['mean_p']:.6f} {ev['n_bursts']} {ev['n_hits']} {ev['level_dbfs']:.4f}"
+        else:
+            tail = "0 0 0 0 0"
+        lines.append(f"{p:.3f} {STATE_CODE[st]} {1 if ac else 0} {code} {tail}")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -3914,29 +4225,63 @@ def _delayed(x, d: float) -> np.ndarray:
     return np.fft.irfft(np.fft.rfft(x) * np.exp(-2j * np.pi * f * d / F.SR), n=n)
 
 
+def _burst(rng, sos):
+    return sosfilt(sos, rng.standard_normal(576))[64:] * 0.1
+
+
 def doa_golden_cases(seed: int = 0):
     rng = np.random.default_rng(seed)
     sos = butter(4, [100, 2000], btype="band", fs=F.SR, output="sos")
     cases = []
     for d in (-3.0, -2.0, -1.5, -1.0, 0.0, 1.0, 1.5, 2.0, 3.0):
-        l = sosfilt(sos, rng.standard_normal(576))[64:] * 0.1
-        r = _delayed(l, d)
-        cases.append((F.float_to_int16(l), F.float_to_int16(r)))
-    a, b = sosfilt(sos, rng.standard_normal(576))[64:] * 0.1, sosfilt(sos, rng.standard_normal(576))[64:] * 0.1
-    cases.append((F.float_to_int16(a), F.float_to_int16(b)))  # uncorrelated pair
+        l = _burst(rng, sos)
+        cases.append((F.float_to_int16(l), F.float_to_int16(_delayed(l, d))))
+    cases.append((F.float_to_int16(_burst(rng, sos)), F.float_to_int16(_burst(rng, sos))))  # uncorrelated pair
     return cases
 
 
-def write_golden_doa(path, params: DoaParams, seed: int = 0) -> None:
+def write_golden_doa_cases(path, params: DoaParams, seed: int = 0) -> None:
     cases = doa_golden_cases(seed)
     with open(path, "wb") as fh:
         fh.write(np.array([len(cases), params.n_fft, params.max_lag], dtype="<i4").tobytes())
         for l, r in cases:
             lag, ratio = gcc_phat(F.int16_to_float(l), F.int16_to_float(r), params.max_lag, params.fs, params.band, params.n_fft)
-            ratio = min(ratio, 1e6)
             fh.write(l.astype("<i2").tobytes())
             fh.write(r.astype("<i2").tobytes())
-            fh.write(np.array([lag, ratio], dtype="<f4").tobytes())
+            fh.write(np.array([lag, min(ratio, 1e6)], dtype="<f4").tobytes())
+
+
+def doa_tracker_frames(seed: int = 0):
+    rng = np.random.default_rng(seed)
+    sos = butter(4, [100, 2000], btype="band", fs=F.SR, output="sos")
+    frames = []
+    for _ in range(25):  # source on the left: signal reaches L two samples early
+        l = _burst(rng, sos)
+        frames.append((F.float_to_int16(l), F.float_to_int16(_delayed(l, 2.0))))
+    for _ in range(5):  # quiet frames, below the noise floor margin
+        q = 1e-5 * rng.standard_normal(512)
+        frames.append((F.float_to_int16(q), F.float_to_int16(q)))
+    for _ in range(10):  # uncorrelated pairs
+        frames.append((F.float_to_int16(_burst(rng, sos)), F.float_to_int16(_burst(rng, sos))))
+    return frames
+
+
+def write_golden_doa_tracker(path, params: DoaParams, seed: int = 0) -> None:
+    frames = doa_tracker_frames(seed)
+    tracker = DoaTracker(params)
+    with open(path, "wb") as fh:
+        fh.write(np.array([len(frames), params.n_fft], dtype="<i4").tobytes())
+        fh.write(np.array([params.spacing_m], dtype="<f4").tobytes())
+        for l, r in frames:
+            lag, valid = tracker.frame(F.int16_to_float(l), F.int16_to_float(r))
+            fh.write(l.astype("<i2").tobytes())
+            fh.write(r.astype("<i2").tobytes())
+            fh.write(np.array([1 if valid else 0], dtype="<i4").tobytes())
+            fh.write(np.array([lag], dtype="<f4").tobytes())
+        ep = tracker.episode()
+        fh.write(np.array([SIDE_CODE[ep["side"]]], dtype="<i4").tobytes())
+        fh.write(np.array([ep["lag_samples"], ep["lag_ms"], ep["conf"]], dtype="<f4").tobytes())
+        fh.write(np.array([ep["n_valid"]], dtype="<i4").tobytes())
 
 
 def write_headers_only(gen_dir, golden_dir, fsm: FsmParams, doa: DoaParams) -> None:
@@ -3946,40 +4291,26 @@ def write_headers_only(gen_dir, golden_dir, fsm: FsmParams, doa: DoaParams) -> N
     write_feature_spec_h(gen_dir / "feature_spec.h")
     write_mel_filterbank_h(gen_dir / "mel_filterbank.h")
     write_golden_fsm(golden_dir / "fsm_trace.txt", fsm)
-    write_golden_doa(golden_dir / "doa_cases.bin", doa)
+    write_golden_doa_cases(golden_dir / "doa_cases.bin", doa)
+    write_golden_doa_tracker(golden_dir / "doa_tracker.bin", doa)
 
 
-def _md_metrics(title: str, m: dict) -> list[str]:
-    return [f"### {title}", "", "| n | pos | AUC | R@FPR2% | tau | precision | recall | FNR | FPR |", "|---|---|---|---|---|---|---|---|---|",
-            f"| {m['n']} | {m['n_pos']} | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['tau']:.3f} | {m['precision']:.3f} | {m['recall']:.3f} | {m['fnr']:.3f} | {m['fpr']:.3f} |", ""]
+def promote(stage, deliv, gen_dir) -> None:
+    stage, deliv, gen_dir = Path(stage), Path(deliv), Path(gen_dir)
+    deliv.mkdir(parents=True, exist_ok=True)
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    for name in PROMOTED_FILES:
+        os.replace(stage / name, deliv / name)
+    for name in HEADER_FILES:
+        shutil.copy(deliv / name, gen_dir / name)
+    if (deliv / "golden").exists():
+        shutil.rmtree(deliv / "golden")
+    shutil.move(str(stage / "golden"), str(deliv / "golden"))
 
 
-def model_card(cfg: dict, info: dict) -> str:
-    out = Path(cfg["paths"]["out_dir"])
-    lines = [f"# SnoozMate v5 snore model card ({date.today().isoformat()})", "", f"model_version: `{info['model_version']}`; feature spec v{F.FEATURE_SPEC_VERSION}; threshold tau = {info['tau']:.3f}", "",
-             f"int8 TFLite: {info['tflite_bytes']} bytes; params: {info['params']}; input quantisation scale {info['qp']['input_scale']:.6f} zero point {info['qp']['input_zero_point']}", "",
-             "## Deployment call sequence", "", "```", "window (int16[16000], hop 8000) -> sf_compute -> sf_quantize(INPUT_SCALE, INPUT_ZERO_POINT)",
-             "  -> TFLM invoke -> p = (out - OUTPUT_ZERO_POINT) * OUTPUT_SCALE -> fsm_tick(p, level_dbfs)", "  -> vibrate only while fsm.state == CONFIRMED and fsm.active", "```", "",
-             "The handwritten float path (snore_infer.c, 63-frame input) is deprecated.", ""]
-    lines += _md_metrics("Validation (protocol B, at tau)", info["threshold_metrics"])
-    if "test" in info.get("protocol_a", {}):
-        lines += _md_metrics("Cross-domain test (protocol A selected run, tau 0.5)", info["protocol_a"]["test"])
-    par = info["parity"]
-    lines += ["### int8 parity", "", f"delta AUC {par['delta_auc']:.4f}; decision agreement {par['agreement']:.4f}; max |dp| {par['max_abs_diff']:.4f}; passed: {par['passed']}", ""]
-    rob = info.get("robustness")
-    if rob:
-        lines += ["### Robustness (Kaggle test)", "", "| condition | AUC | R@FPR2% | recall@tau | FPR@tau |", "|---|---|---|---|---|"]
-        lines.append(f"| clean | {rob['clean']['auc']:.4f} | {rob['clean']['recall_at_fpr2']:.3f} | {rob['clean']['recall']:.3f} | {rob['clean']['fpr']:.3f} |")
-        for k, m in rob["snr"].items():
-            lines.append(f"| SNR {k} dB | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['recall']:.3f} | {m['fpr']:.3f} |")
-        for k, m in rob["distance"].items():
-            lines.append(f"| RIR {k} m | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['recall']:.3f} | {m['fpr']:.3f} |")
-        lines.append("")
-    for name in ("manifest_report.md", "experiments.md", "benchmark_nights.md", "doa_sim.md"):
-        p = out / "deliverables" / name
-        if p.exists():
-            lines += [f"## {name}", "", p.read_text(encoding="utf-8"), ""]
-    return "\n".join(lines)
+def _write_status(deliv: Path, status: str, **extra) -> None:
+    deliv.mkdir(parents=True, exist_ok=True)
+    (deliv / "export_status.json").write_text(json.dumps({"status": status, "at": datetime.now().isoformat(timespec="seconds"), **extra}, indent=1))
 
 
 def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
@@ -3987,58 +4318,98 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
 
     from v5.data import manifest as M
     from v5.data.dataset import precompute_features
-    from v5.evaluate import int8_parity, int8_probs, predict_probs, robustness_sweep
+    from v5.evaluate import clip_metrics, int8_parity, int8_probs, predict_probs, robustness_sweep
+    from v5.model import check_ops
 
     out = Path(cfg["paths"]["out_dir"])
-    deliv, golden = out / "deliverables", out / "deliverables" / "golden"
-    deliv.mkdir(parents=True, exist_ok=True)
-    thr = json.loads(Path(threshold_path or out / "threshold.json").read_text())
-    tau, model_version = float(thr["tau"]), thr["model_version"]
-    fsm = FsmParams.from_config(tau, thr["fsm"])
-    doa = DoaParams(spacing_m=float(cfg["doa"]["spacing_m"]))
-    write_headers_only(GEN_DIR, golden, fsm, doa)
-    model = keras.models.load_model(model_path or out / "deployed" / "model.keras", compile=False)
-    rows = M.read_manifest(out / "manifest.csv")
-    _, audio, _ = M.load_cache(out)
-    y = np.array([r["label"] for r in rows])
-    tr = M.split_indices(rows, "split_b", "train")
-    rng = np.random.default_rng(cfg["seed"])
-    rep = precompute_features(audio[rng.choice(tr, size=min(500, len(tr)), replace=False)])
-    tflite = to_tflite_int8(model, rep)
-    (deliv / "snore_v5_int8.tflite").write_bytes(tflite)
-    qp = quant_params(tflite)
-    write_c_array(tflite, "snore_v5_int8_tflite", GEN_DIR / "model_data.h", GEN_DIR / "model_data.c")
-    write_model_meta_h(GEN_DIR / "model_meta.h", qp, tau, fsm, model_version)
-    te = M.split_indices(rows, "split_a", "test")
-    snore = [audio[i] for i in te if y[i] == 1][:4]
-    noise = [audio[i] for i in te if y[i] == 0][:4]
-    names, gx, gX = G.make_golden(snore, noise)
-    G.write_golden_npz(golden / "features.npz", names, gx, gX)
-    G.write_golden_bin(golden / "features.bin", gx, gX)
-    Xt = precompute_features(audio[te])
-    p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
-    parity = int8_parity(p_fp, p_i8, y[te], tau)
-    bench_noise = audio[[r["id"] for r in rows if r["split_a"] == "bench"]]
-    robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
-    (deliv / "robustness.json").write_text(json.dumps(robustness, indent=1))
-    from v5.evaluate import clip_metrics
+    deliv, stage = out / "deliverables", out / "export_stage"
+    try:
+        if stage.exists():
+            shutil.rmtree(stage)
+        golden = stage / "golden"
+        golden.mkdir(parents=True)
+        thr = json.loads(Path(threshold_path or out / "threshold.json").read_text())
+        tau, model_version = float(thr["tau"]), thr["model_version"]
+        fsm = FsmParams.from_config(tau, thr["fsm"])
+        doa = DoaParams(spacing_m=float(cfg["doa"]["spacing_m"]))
+        model = keras.models.load_model(model_path or out / "deployed" / "model.keras", compile=False)
+        check_ops(model)
+        rows = M.read_manifest(out / "manifest.csv")
+        _, audio, _ = M.load_cache(out)
+        y = np.array([r["label"] for r in rows])
+        tr, te = M.split_indices(rows, "train"), M.split_indices(rows, "test")
+        rng = np.random.default_rng(cfg["seed"])
+        tflite = to_tflite_int8(model, precompute_features(audio[rng.choice(tr, size=min(500, len(tr)), replace=False)]))
+        valid = validate_tflite(tflite)
+        (stage / "snore_v5_int8.tflite").write_bytes(tflite)
+        write_headers_only(stage, golden, fsm, doa)
+        write_c_array(tflite, "snore_v5_int8_tflite", stage / "model_data.h", stage / "model_data.c")
+        write_model_meta_h(stage / "model_meta.h", valid, tau, fsm, model_version)
+        snore = [audio[i] for i in te if y[i] == 1][:4]
+        noise = [audio[i] for i in te if y[i] == 0][:4]
+        names, gx, gX, gq = G.make_golden(snore, noise, scale=valid["input_scale"], zero_point=valid["input_zero_point"])
+        G.write_golden_npz(golden / "features.npz", names, gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
+        G.write_golden_bin(golden / "features.bin", gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
+        Xt = precompute_features(audio[te])
+        p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
+        parity = int8_parity(p_fp, p_i8, y[te], tau)
+        check_parity(parity)
+        test_metrics = {"float": clip_metrics(y[te], p_fp, tau), "int8": clip_metrics(y[te], p_i8, tau)}
+        bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench"]]
+        robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
+        info = {"model_version": model_version, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
+                "tflite_sha256": hashlib.sha256(tflite).hexdigest(), "params": int(model.count_params()), "qp": valid, "parity": parity, "parity_limits": PARITY_LIMITS,
+                "arena": arena_estimate(model, len(tflite)), "test": test_metrics, "n_test": int(len(te)), "exported_at": datetime.now().isoformat(timespec="seconds")}
+        (stage / "export_info.json").write_text(json.dumps(info, indent=1))
+        (stage / "test_metrics.json").write_text(json.dumps(test_metrics, indent=1))
+        (stage / "robustness.json").write_text(json.dumps(robustness, indent=1))
+        promote(stage, deliv, GEN_DIR)
+        shutil.rmtree(stage)
+        _write_status(deliv, "ok", model_version=model_version, tflite_sha256=info["tflite_sha256"])
+        return info
+    except Exception as exc:
+        _write_status(deliv, "failed", error=f"{type(exc).__name__}: {exc}", stage=str(stage))
+        raise
 
-    va = M.split_indices(rows, "split_b", "val")
-    thr_metrics = clip_metrics(y[va], predict_probs(model, precompute_features(audio[va])), tau)
-    sel = out / "selection.json"
-    protocol_a = {}
-    if sel.exists():
-        name = json.loads(sel.read_text())["name"]
-        mp = out / "runs" / name / "metrics.json"
-        if mp.exists():
-            protocol_a = json.loads(mp.read_text())
-    info = {"model_version": model_version, "tau": tau, "tflite_bytes": len(tflite), "params": int(model.count_params()), "qp": qp, "parity": parity,
-            "robustness": robustness, "threshold_metrics": thr_metrics, "protocol_a": protocol_a}
-    (deliv / "model_card.md").write_text(model_card(cfg, info), encoding="utf-8")
-    for name in ("feature_spec.h", "mel_filterbank.h", "model_meta.h", "model_data.h", "model_data.c"):
-        shutil.copy(GEN_DIR / name, deliv / name)
-    (deliv / "export_info.json").write_text(json.dumps({k: v for k, v in info.items() if k != "robustness"}, indent=1))
-    return info
+
+def _md_metrics(title: str, m: dict) -> list[str]:
+    return [f"### {title}", "", "| n | pos | AUC | R@FPR2% | tau | precision | recall | FNR | FPR |", "|---|---|---|---|---|---|---|---|---|",
+            f"| {m['n']} | {m['n_pos']} | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['tau']:.3f} | {m['precision']:.3f} | {m['recall']:.3f} | {m['fnr']:.3f} | {m['fpr']:.3f} |", ""]
+
+
+def model_card(cfg: dict) -> str:
+    deliv = Path(cfg["paths"]["out_dir"]) / "deliverables"
+    status = json.loads((deliv / "export_status.json").read_text())
+    if status["status"] != "ok":
+        raise ExportError(f"last export did not pass the gates: {status}")
+    info = json.loads((deliv / "export_info.json").read_text())
+    rob = json.loads((deliv / "robustness.json").read_text())
+    cal = info.get("calib") or {}
+    lines = [f"# SnoozMate v5 snore model card ({date.today().isoformat()})", "",
+             f"model_version: `{info['model_version']}`; run `{info.get('run')}`; feature spec v{F.FEATURE_SPEC_VERSION}; tau = {info['tau']:.4f}; exported {info['exported_at']}", "",
+             f"int8 TFLite: {info['tflite_bytes']} bytes (sha256 {info['tflite_sha256'][:12]}); params {info['params']}; input scale {info['qp']['input_scale']:.6f} zero point {info['qp']['input_zero_point']}; ops {info['qp'].get('ops')}", "",
+             f"arena estimate: {info['arena']['activation_bytes_estimate']} bytes activations (largest tensor {info['arena']['largest_tensor_bytes']}); {info['arena']['note']}", "",
+             f"calibration (calib split): n_neg {cal.get('n_neg')}, FPR {cal.get('fpr', float('nan')):.4f} (95% upper bound {cal.get('fpr_upper95', float('nan')):.4f}), recall {cal.get('recall', float('nan')):.3f}", "",
+             "## Deployment call sequence", "", "```", "window (int16[16000], hop 8000) -> sf_compute -> sf_quantize(INPUT_SCALE, INPUT_ZERO_POINT)",
+             "  -> TFLM invoke -> p = (out - OUTPUT_ZERO_POINT) * OUTPUT_SCALE -> fsm_tick(p, level_dbfs)", "  -> vibrate only while fsm.state == FSM_CONFIRMED and fsm.active", "```", "",
+             "The handwritten float path (snore_infer.c, 63-frame input) is deprecated. Desktop C tests establish numerical parity, not ESP32-S3 deployability;",
+             "the firmware build must still verify the TFLM operator resolver, the real tensor arena size and flash use.", ""]
+    lines += _md_metrics("Test split, float model (evaluated once at export)", info["test"]["float"])
+    lines += _md_metrics("Test split, int8 model (deployed path)", info["test"]["int8"])
+    par = info["parity"]
+    lines += ["### int8 parity gate", "", f"delta AUC {par['delta_auc']:.4f}; decision agreement {par['agreement']:.4f}; max |dp| {par['max_abs_diff']:.4f}; limits {info['parity_limits']}; passed: {par['passed']}", ""]
+    lines += ["### Robustness (test split, float model)", "", "| condition | AUC | R@FPR2% | recall@tau | FPR@tau |", "|---|---|---|---|---|",
+              f"| clean | {rob['clean']['auc']:.4f} | {rob['clean']['recall_at_fpr2']:.3f} | {rob['clean']['recall']:.3f} | {rob['clean']['fpr']:.3f} |"]
+    for k, m in rob["snr"].items():
+        lines.append(f"| SNR {k} dB | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['recall']:.3f} | {m['fpr']:.3f} |")
+    for k, m in rob["distance"].items():
+        lines.append(f"| RIR {k} m | {m['auc']:.4f} | {m['recall_at_fpr2']:.3f} | {m['recall']:.3f} | {m['fpr']:.3f} |")
+    lines.append("")
+    for name in ("manifest_report.md", "experiments.md", "benchmark_nights.md", "doa_sim.md"):
+        p = deliv / name
+        if p.exists():
+            lines += [f"## {name}", "", p.read_text(encoding="utf-8"), ""]
+    return "\n".join(lines)
 
 
 def main(argv=None) -> None:
@@ -4048,19 +4419,24 @@ def main(argv=None) -> None:
     m = sub.add_parser("model")
     m.add_argument("--model", default=None)
     m.add_argument("--threshold", default=None)
-    for p in (h, m):
+    c = sub.add_parser("card")
+    for p in (h, m, c):
         p.add_argument("--config", default=None)
     args = ap.parse_args(argv)
     cfg = resolve(load_config(args.config))
     out = Path(cfg["paths"]["out_dir"])
     if args.cmd == "headers":
         thr = out / "threshold.json"
-        tau = json.loads(thr.read_text())["tau"] if thr.exists() else float(cfg["threshold"]["fallback"])
+        tau = json.loads(thr.read_text())["tau"] if thr.exists() else 0.65
         write_headers_only(GEN_DIR, out / "deliverables" / "golden", FsmParams.from_config(tau, cfg["fsm"]), DoaParams(spacing_m=float(cfg["doa"]["spacing_m"])))
         print(f"headers -> {GEN_DIR}; golden -> {out / 'deliverables' / 'golden'}")
-    else:
+    elif args.cmd == "model":
         info = export_model(cfg, args.model, args.threshold)
-        print(json.dumps({k: info[k] for k in ("model_version", "tau", "tflite_bytes", "params", "parity")}, indent=1))
+        print(json.dumps({k: info[k] for k in ("model_version", "tau", "tflite_bytes", "params", "parity", "test")}, indent=1))
+    else:
+        text = model_card(cfg)
+        (out / "deliverables" / "model_card.md").write_text(text, encoding="utf-8")
+        print(text[:2000])
 
 
 if __name__ == "__main__":
@@ -4076,11 +4452,8 @@ Expected: PASS
 
 ```bash
 git add v5/export.py tests/test_export.py
-git commit -m "feat(v5): exporter for int8 TFLite, C headers, golden files and model card"
+git commit -m "feat(v5): exporter with release gates, staged promotion and golden files"
 ```
-
----
-
 ### Task 21: C feature extractor with host parity test
 
 **Files:**
@@ -4089,7 +4462,8 @@ git commit -m "feat(v5): exporter for int8 TFLite, C headers, golden files and m
 
 **Interfaces:**
 - Produces C API: `void fft512_init(void); void fft512_forward(float *re, float *im); void fft512_inverse(float *re, float *im);` and `void sf_init(void); void sf_compute(const int16_t *win, float *X); void sf_quantize(const float *X, int8_t *q, float scale, int zero_point);` with `X` row-major `[frame][mel]`, 1830 floats.
-- `make -C esp32_firmware/v5 test GOLDEN=<dir>` builds and runs every host test against the golden directory.
+- Parity contract (numerical, not bit-exact): float features within `max |dX| <= 5e-3` of the Python float64 reference on every cell; quantized features never differ by more than 1 LSB and differ by exactly 1 LSB on at most 1 % of cells. The FSM contract (Task 22) is exact equality.
+- Makefile targets: `test-features`, `test-fsm`, `test-doa`, `test` (all three); `GOLDEN=<dir>` selects the golden directory (default `../../output/v5/deliverables/golden`).
 
 - [ ] **Step 1: Write the pytest wrapper (fails until the C code exists)**
 
@@ -4109,24 +4483,30 @@ from v5.doa import DoaParams
 from v5.streaming import FsmParams
 
 FW = ROOT / "esp32_firmware" / "v5"
+SCALE, ZP = 1.0 / 127.0, 0
 
 
 def _synthetic_golden(golden_dir):
     rng = np.random.default_rng(7)
-    snore = [F.float_to_int16(0.1 * rng.standard_normal(F.WIN) * (0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * np.arange(F.WIN) / F.SR))) for _ in range(4)]
+    env = 0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * np.arange(F.WIN) / F.SR)
+    snore = [F.float_to_int16(0.1 * rng.standard_normal(F.WIN) * env) for _ in range(4)]
     noise = [F.float_to_int16(0.02 * rng.standard_normal(F.WIN)) for _ in range(4)]
-    names, x, Xg = G.make_golden(snore, noise)
-    G.write_golden_bin(golden_dir / "features.bin", x, Xg)
+    names, x, Xg, q = G.make_golden(snore, noise, scale=SCALE, zero_point=ZP)
+    G.write_golden_bin(golden_dir / "features.bin", x, Xg, q, SCALE, ZP)
+
+
+def _run(target, golden):
+    build = subprocess.run(["make", "-C", str(FW), target, f"GOLDEN={golden}"], capture_output=True, text=True)
+    print(build.stdout[-4000:], build.stderr[-4000:])
+    assert build.returncode == 0, f"{target} failed; see output above"
 
 
 @pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
-def test_c_sources_match_python_reference(tmp_path):
+def test_c_features_match_python_reference(tmp_path):
     golden = tmp_path / "golden"
     X.write_headers_only(FW / "generated", golden, FsmParams(), DoaParams())
     _synthetic_golden(golden)
-    build = subprocess.run(["make", "-C", str(FW), "test", f"GOLDEN={golden}"], capture_output=True, text=True)
-    print(build.stdout[-4000:], build.stderr[-4000:])
-    assert build.returncode == 0, "host tests failed; see output above"
+    _run("test-features", golden)
 ```
 
 - [ ] **Step 2: Run the wrapper to verify it fails**
@@ -4140,7 +4520,7 @@ Expected: FAIL (make: no rule / missing sources)
 ```c
 #pragma once
 /* Radix-2 complex FFT, N = 512, float32. Firmware may replace this with esp-dsp
- * (dsps_fft2r_fc32) as long as host_test/test_features still passes. */
+ * (dsps_fft2r_fc32) as long as the host parity tests still pass. */
 void fft512_init(void);
 void fft512_forward(float *re, float *im);
 void fft512_inverse(float *re, float *im); /* includes the 1/N scale */
@@ -4275,7 +4655,9 @@ void sf_quantize(const float *X, int8_t *q, float scale, int zero_point) {
 
 `esp32_firmware/v5/host_test/test_features.c`:
 ```c
-/* Usage: test_features <features.bin>. Exit 0 when max |dX| <= 5e-3 on every case. */
+/* Usage: test_features <features.bin>.
+ * Exit 0 when every case has max |dX| <= 5e-3, no quantised cell differs by more than 1 LSB,
+ * and at most 1 % of quantised cells differ by exactly 1 LSB. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -4286,29 +4668,37 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s features.bin\n", argv[0]); return 2; }
     FILE *fh = fopen(argv[1], "rb");
     if (!fh) { perror("open"); return 2; }
-    int32_t hdr[3];
-    if (fread(hdr, sizeof(int32_t), 3, fh) != 3) { fprintf(stderr, "bad header\n"); return 2; }
+    int32_t hdr[3], zp;
+    float scale;
+    if (fread(hdr, sizeof(int32_t), 3, fh) != 3 || fread(&scale, sizeof(float), 1, fh) != 1 || fread(&zp, sizeof(int32_t), 1, fh) != 1) { fprintf(stderr, "bad header\n"); return 2; }
     if (hdr[1] != SF_WIN || hdr[2] != SF_FEATURE_DIM) { fprintf(stderr, "golden shape mismatch\n"); return 2; }
     int16_t *win = malloc(sizeof(int16_t) * SF_WIN);
     float *ref = malloc(sizeof(float) * SF_FEATURE_DIM);
     float *X = malloc(sizeof(float) * SF_FEATURE_DIM);
+    int8_t *qref = malloc(SF_FEATURE_DIM), *q = malloc(SF_FEATURE_DIM);
     double worst = 0.0;
     int failures = 0;
     sf_init();
     for (int c = 0; c < hdr[0]; c++) {
         if (fread(win, sizeof(int16_t), SF_WIN, fh) != (size_t)SF_WIN) return 2;
         if (fread(ref, sizeof(float), SF_FEATURE_DIM, fh) != (size_t)SF_FEATURE_DIM) return 2;
+        if (fread(qref, 1, SF_FEATURE_DIM, fh) != (size_t)SF_FEATURE_DIM) return 2;
         sf_compute(win, X);
+        sf_quantize(X, q, scale, zp);
         double maxd = 0.0;
-        int bad = 0;
+        int bad = 0, one_lsb = 0, over = 0;
         for (int i = 0; i < SF_FEATURE_DIM; i++) {
             double d = fabs((double)X[i] - (double)ref[i]);
             if (d > maxd) maxd = d;
             if (d > 5e-3) bad++;
+            int dq = abs((int)q[i] - (int)qref[i]);
+            if (dq == 1) one_lsb++;
+            if (dq > 1) over++;
         }
         if (maxd > worst) worst = maxd;
-        printf("case %2d: max|dX| = %.5f, cells over tolerance = %d\n", c, maxd, bad);
-        if (bad) failures++;
+        int ok = bad == 0 && over == 0 && one_lsb * 100 <= SF_FEATURE_DIM;
+        printf("case %2d: max|dX| = %.5f, cells over tolerance = %d, q off by 1 LSB = %d, q off by >1 = %d %s\n", c, maxd, bad, one_lsb, over, ok ? "ok" : "MISMATCH");
+        if (!ok) failures++;
     }
     fclose(fh);
     printf("features parity: worst %.5f over %d cases, %d failing\n", worst, hdr[0], failures);
@@ -4320,51 +4710,41 @@ int main(int argc, char **argv) {
 ```make
 CC ?= cc
 CFLAGS ?= -std=c99 -O2 -Wall -Wextra -I. -Igenerated
-SRC = fft512.c snore_features.c snore_episode_fsm.c doa_gccphat.c
 GOLDEN ?= ../../output/v5/deliverables/golden
-TESTS = build/test_features build/test_fsm build/test_doa
-
-all: $(TESTS)
 
 build:
 	mkdir -p build
 
-build/%: host_test/%.c $(SRC) | build
-	$(CC) $(CFLAGS) -o $@ $< $(SRC) -lm
+build/test_features: host_test/test_features.c fft512.c snore_features.c | build
+	$(CC) $(CFLAGS) -o $@ host_test/test_features.c fft512.c snore_features.c -lm
 
-test: all
+build/test_fsm: host_test/test_fsm.c snore_episode_fsm.c | build
+	$(CC) $(CFLAGS) -o $@ host_test/test_fsm.c snore_episode_fsm.c -lm
+
+build/test_doa: host_test/test_doa.c fft512.c doa_gccphat.c | build
+	$(CC) $(CFLAGS) -o $@ host_test/test_doa.c fft512.c doa_gccphat.c -lm
+
+test-features: build/test_features
 	./build/test_features $(GOLDEN)/features.bin
+
+test-fsm: build/test_fsm
 	./build/test_fsm $(GOLDEN)/fsm_trace.txt
-	./build/test_doa $(GOLDEN)/doa_cases.bin
+
+test-doa: build/test_doa
+	./build/test_doa $(GOLDEN)/doa_cases.bin $(GOLDEN)/doa_tracker.bin
+
+test: test-features test-fsm test-doa
 
 clean:
 	rm -rf build
 
-.PHONY: all test clean
+.PHONY: test test-features test-fsm test-doa clean
 ```
 
-Until Tasks 22 and 23 add `snore_episode_fsm.c` and `doa_gccphat.c`, create them as empty placeholders so the Makefile links (`touch esp32_firmware/v5/snore_episode_fsm.c esp32_firmware/v5/doa_gccphat.c`) and temporarily run only the features test by hand: `make -C esp32_firmware/v5 build/test_features && esp32_firmware/v5/build/test_features <golden>/features.bin`. The pytest wrapper passes only once Tasks 22–23 are done; that is expected.
+- [ ] **Step 4: Generate headers and run the features test**
 
-- [ ] **Step 4: Generate headers and run the features test by hand**
-
-Run:
-```bash
-.venv-mac/bin/python -m v5.export headers
-.venv-mac/bin/python - <<'PY'
-from pathlib import Path
-import numpy as np
-from v5 import features as F, golden as G
-rng = np.random.default_rng(7)
-s = [F.float_to_int16(0.1*rng.standard_normal(F.WIN)) for _ in range(4)]
-n = [F.float_to_int16(0.02*rng.standard_normal(F.WIN)) for _ in range(4)]
-names, x, X = G.make_golden(s, n)
-Path('/tmp/v5golden').mkdir(exist_ok=True)
-G.write_golden_bin('/tmp/v5golden/features.bin', x, X)
-PY
-touch esp32_firmware/v5/snore_episode_fsm.c esp32_firmware/v5/doa_gccphat.c
-make -C esp32_firmware/v5 build/test_features && esp32_firmware/v5/build/test_features /tmp/v5golden/features.bin
-```
-Expected: every case prints `cells over tolerance = 0`; exit code 0. If the chirp or sine case exceeds 5e-3, the cause is float32 cancellation in near-empty bins; raise the noise floor of those synthetic signals in `v5/golden.py` (3e-4 → 1e-3) rather than loosening the tolerance, and note it in the commit.
+Run: `.venv-mac/bin/python -m v5.export headers && .venv-mac/bin/python -m pytest tests/test_c_parity.py -v`
+Expected: PASS; the make output shows every case `ok` with `q off by >1 = 0`. If a synthetic case exceeds 5e-3, raise the noise floor of that signal in `v5/golden.py` (3e-4 → 1e-3) rather than loosening the tolerance, and note it in the commit.
 
 - [ ] **Step 5: Commit**
 
@@ -4372,24 +4752,24 @@ Expected: every case prints `cells over tolerance = 0`; exit code 0. If the chir
 git add esp32_firmware/v5 tests/test_c_parity.py
 git commit -m "feat(fw-v5): C feature extractor with FFT and host parity test"
 ```
-
----
-
 ### Task 22: C episode state machine
 
 **Files:**
-- Create: `esp32_firmware/v5/snore_episode_fsm.h`, `esp32_firmware/v5/snore_episode_fsm.c` (replaces the placeholder), `esp32_firmware/v5/host_test/test_fsm.c`
+- Create: `esp32_firmware/v5/snore_episode_fsm.h`, `esp32_firmware/v5/snore_episode_fsm.c`, `esp32_firmware/v5/host_test/test_fsm.c`
+- Modify: `tests/test_c_parity.py` (add the fsm test)
 
 **Interfaces:**
-- Produces C API: `typedef struct { float tau; int tick_ms, hold_ticks, confirm_ticks, verify_ticks, min_bursts, period_min_ticks, period_max_ticks; } fsm_params_t;` `typedef enum { FSM_IDLE = 0, FSM_ACTIVE = 1, FSM_CONFIRMED = 2 } fsm_state_t;` `typedef enum { FSM_EV_NONE = 0, FSM_EV_EPISODE_START = 1, FSM_EV_EPISODE_END = 2 } fsm_event_t;` `void fsm_init(fsm_t *f, const fsm_params_t *p); fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs);` plus readable fields `f->state`, `f->active`, `f->activity`, and after an end event `f->last_duration_s`, `f->last_mean_p`, `f->last_n_bursts`, `f->last_level_dbfs`, `f->last_start_tick`.
+- Produces C API: `typedef struct { float tau; int tick_ms, hold_ticks, confirm_ticks, verify_ticks, min_bursts, period_min_ticks, period_max_ticks; } fsm_params_t;` `typedef enum { FSM_IDLE = 0, FSM_ACTIVE = 1, FSM_CONFIRMED = 2 } fsm_state_t;` `typedef enum { FSM_EV_NONE = 0, FSM_EV_EPISODE_START = 1, FSM_EV_EPISODE_END = 2 } fsm_event_t;` `void fsm_init(fsm_t *f, const fsm_params_t *p); fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs);` plus readable fields `f->state`, `f->active`, `f->activity`, and after an end event `f->last_duration_s`, `f->last_mean_p`, `f->last_n_bursts`, `f->last_n_hits`, `f->last_level_dbfs`, `f->last_start_tick`.
+- Parity contract: state, active flag and event code equal on every tick; on end events duration within 1e-3 s, mean probability within 1e-4, burst and hit counts exact, level within 1e-3 dB.
 
-- [ ] **Step 1: Write the host test**
+- [ ] **Step 1: Write the host test and extend the pytest wrapper**
 
 `esp32_firmware/v5/host_test/test_fsm.c`:
 ```c
-/* Usage: test_fsm <fsm_trace.txt>. Replays the Python reference trace and compares state, active flag and event. */
+/* Usage: test_fsm <fsm_trace.txt>. Replays the Python reference trace. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "snore_episode_fsm.h"
 
 int main(int argc, char **argv) {
@@ -4403,21 +4783,36 @@ int main(int argc, char **argv) {
     }
     fsm_t f;
     fsm_init(&f, &p);
-    float prob;
-    int state, active, event, tick = 0, mismatches = 0;
-    while (fscanf(fh, "%f %d %d %d", &prob, &state, &active, &event) == 4) {
-        fsm_event_t ev = fsm_tick(&f, prob, -40.0f);
-        if ((int)f.state != state || f.active != active || (int)ev != event) {
-            if (mismatches < 10)
-                printf("tick %d: p=%.3f expected state %d active %d event %d, got %d %d %d\n", tick, prob, state, active, event, (int)f.state, f.active, (int)ev);
-            mismatches++;
+    float prob, dur, mean_p, level;
+    int state, active, event, n_bursts, n_hits, tick = 0, mismatches = 0, ends = 0;
+    while (fscanf(fh, "%f %d %d %d %f %f %d %d %f", &prob, &state, &active, &event, &dur, &mean_p, &n_bursts, &n_hits, &level) == 9) {
+        float lvl = -40.0f + 5.0f * sinf((float)tick / 7.0f);
+        fsm_event_t ev = fsm_tick(&f, prob, lvl);
+        int ok = (int)f.state == state && f.active == active && (int)ev == event;
+        if (ok && event == 2) {
+            ends++;
+            ok = fabsf(f.last_duration_s - dur) <= 1e-3f && fabsf(f.last_mean_p - mean_p) <= 1e-4f && f.last_n_bursts == n_bursts && f.last_n_hits == n_hits && fabsf(f.last_level_dbfs - level) <= 1e-3f;
+            if (!ok && mismatches < 10)
+                printf("tick %d: end fields expected dur %.3f mean %.6f bursts %d hits %d level %.4f, got %.3f %.6f %d %d %.4f\n", tick, dur, mean_p, n_bursts, n_hits, level, f.last_duration_s, f.last_mean_p, f.last_n_bursts, f.last_n_hits, f.last_level_dbfs);
+        } else if (!ok && mismatches < 10) {
+            printf("tick %d: p=%.3f expected state %d active %d event %d, got %d %d %d\n", tick, prob, state, active, event, (int)f.state, f.active, (int)ev);
         }
+        if (!ok) mismatches++;
         tick++;
     }
     fclose(fh);
-    printf("fsm parity: %d ticks, %d mismatches\n", tick, mismatches);
-    return mismatches ? 1 : 0;
+    printf("fsm parity: %d ticks, %d end events checked, %d mismatches\n", tick, ends, mismatches);
+    return (mismatches || ends == 0) ? 1 : 0;
 }
+```
+
+Append to `tests/test_c_parity.py`:
+```python
+@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+def test_c_fsm_matches_python_trace(tmp_path):
+    golden = tmp_path / "golden"
+    X.write_headers_only(FW / "generated", golden, FsmParams(), DoaParams())
+    _run("test-fsm", golden)
 ```
 
 - [ ] **Step 2: Implement the FSM**
@@ -4429,6 +4824,7 @@ int main(int argc, char **argv) {
 
 #define FSM_MAX_HIST 64
 #define FSM_MAX_BURSTS 64
+#define FSM_MAX_HITS 64
 
 typedef struct {
     float tau;
@@ -4447,6 +4843,9 @@ typedef struct {
     int streak_q, in_burst;
     uint32_t bursts[FSM_MAX_BURSTS];
     int n_bursts;
+    uint32_t hit_tick[FSM_MAX_HITS];
+    float hit_p[FSM_MAX_HITS], hit_level[FSM_MAX_HITS];
+    int n_hits_buf;
     int active;
     float activity;
     int below_ticks;
@@ -4454,7 +4853,7 @@ typedef struct {
     int ep_n_bursts, ep_n_hits;
     float ep_sum_p, ep_sum_level;
     float last_duration_s, last_mean_p, last_level_dbfs;
-    int last_n_bursts;
+    int last_n_bursts, last_n_hits;
     uint32_t last_start_tick;
 } fsm_t;
 
@@ -4490,10 +4889,18 @@ static int periodic(const fsm_t *f) {
     return med >= (uint32_t)f->p.period_min_ticks && med <= (uint32_t)f->p.period_max_ticks;
 }
 
+static void drop_front_hit(fsm_t *f) {
+    memmove(f->hit_tick, f->hit_tick + 1, (size_t)(f->n_hits_buf - 1) * sizeof(uint32_t));
+    memmove(f->hit_p, f->hit_p + 1, (size_t)(f->n_hits_buf - 1) * sizeof(float));
+    memmove(f->hit_level, f->hit_level + 1, (size_t)(f->n_hits_buf - 1) * sizeof(float));
+    f->n_hits_buf--;
+}
+
 fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs) {
     const fsm_params_t *P = &f->p;
     uint32_t i = f->tick++;
     int cap = P->hold_ticks + 1;
+    uint32_t max_age = (uint32_t)(P->confirm_ticks + P->hold_ticks);
     fsm_event_t ev = FSM_EV_NONE;
     f->hist[f->hist_pos] = p;
     f->hist_pos = (f->hist_pos + 1) % cap;
@@ -4505,11 +4912,18 @@ fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs) {
     f->active = act >= P->tau;
     int burst_started = hit && !f->in_burst;
     if (burst_started && f->n_bursts < FSM_MAX_BURSTS) f->bursts[f->n_bursts++] = i;
+    if (hit && f->n_hits_buf < FSM_MAX_HITS) {
+        f->hit_tick[f->n_hits_buf] = i;
+        f->hit_p[f->n_hits_buf] = p;
+        f->hit_level[f->n_hits_buf] = level_dbfs;
+        f->n_hits_buf++;
+    }
     f->in_burst = hit;
-    while (f->n_bursts > 0 && i - f->bursts[0] > (uint32_t)(P->confirm_ticks + P->hold_ticks)) {
+    while (f->n_bursts > 0 && i - f->bursts[0] > max_age) {
         memmove(f->bursts, f->bursts + 1, (size_t)(f->n_bursts - 1) * sizeof(uint32_t));
         f->n_bursts--;
     }
+    while (f->n_hits_buf > 0 && i - f->hit_tick[0] > max_age) drop_front_hit(f);
     if (f->active) {
         f->streak_q += 2;
         if (f->streak_q > 4 * P->confirm_ticks) f->streak_q = 4 * P->confirm_ticks;
@@ -4521,14 +4935,23 @@ fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs) {
         if (f->streak_q == 0) {
             f->state = FSM_IDLE;
         } else if (f->streak_q >= 2 * P->confirm_ticks && periodic(f)) {
+            uint32_t first = f->bursts[0];
             f->state = FSM_CONFIRMED;
             f->below_ticks = 0;
-            f->ep_first_burst = f->bursts[0];
+            f->ep_first_burst = first;
             f->ep_last_hit = i;
             f->ep_n_bursts = f->n_bursts;
-            f->ep_sum_p = hit ? p : 0.0f;
-            f->ep_n_hits = hit ? 1 : 0;
-            f->ep_sum_level = hit ? level_dbfs : 0.0f;
+            f->ep_sum_p = 0.0f;
+            f->ep_sum_level = 0.0f;
+            f->ep_n_hits = 0;
+            for (int k = 0; k < f->n_hits_buf; k++) {
+                if (f->hit_tick[k] >= first) {
+                    f->ep_sum_p += f->hit_p[k];
+                    f->ep_sum_level += f->hit_level[k];
+                    f->ep_n_hits++;
+                    f->ep_last_hit = f->hit_tick[k];
+                }
+            }
             ev = FSM_EV_EPISODE_START;
         }
     } else if (f->state == FSM_CONFIRMED) {
@@ -4547,10 +4970,12 @@ fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs) {
                 f->last_mean_p = f->ep_sum_p / (float)n;
                 f->last_level_dbfs = f->ep_sum_level / (float)n;
                 f->last_n_bursts = f->ep_n_bursts;
+                f->last_n_hits = f->ep_n_hits;
                 f->last_start_tick = f->ep_first_burst;
                 f->state = FSM_IDLE;
                 f->streak_q = 0;
                 f->n_bursts = 0;
+                f->n_hits_buf = 0;
                 f->in_burst = 0;
                 ev = FSM_EV_EPISODE_END;
             }
@@ -4564,59 +4989,110 @@ fsm_event_t fsm_tick(fsm_t *f, float p, float level_dbfs) {
 
 - [ ] **Step 3: Build and run against the golden trace**
 
-Run: `make -C esp32_firmware/v5 build/test_fsm && esp32_firmware/v5/build/test_fsm output/v5/deliverables/golden/fsm_trace.txt`
-Expected: `fsm parity: N ticks, 0 mismatches`, exit 0.
+Run: `.venv-mac/bin/python -m pytest tests/test_c_parity.py -v -k fsm`
+Expected: PASS with `fsm parity: N ticks, K end events checked, 0 mismatches`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add esp32_firmware/v5/snore_episode_fsm.h esp32_firmware/v5/snore_episode_fsm.c esp32_firmware/v5/host_test/test_fsm.c
+git add esp32_firmware/v5/snore_episode_fsm.h esp32_firmware/v5/snore_episode_fsm.c esp32_firmware/v5/host_test/test_fsm.c tests/test_c_parity.py
 git commit -m "feat(fw-v5): episode state machine in C with golden-trace test"
 ```
-
----
-
 ### Task 23: C GCC-PHAT direction module
 
 **Files:**
-- Create: `esp32_firmware/v5/doa_gccphat.h`, `esp32_firmware/v5/doa_gccphat.c` (replaces the placeholder), `esp32_firmware/v5/host_test/test_doa.c`
+- Create: `esp32_firmware/v5/doa_gccphat.h`, `esp32_firmware/v5/doa_gccphat.c`, `esp32_firmware/v5/host_test/test_doa.c`
+- Modify: `tests/test_c_parity.py` (add the doa test and the aggregate `test` target)
 
 **Interfaces:**
 - Produces C API: `void doa_gcc_phat(const float *l, const float *r, int max_lag, float band_lo, float band_hi, float *lag, float *ratio);` (512-sample frames, same sign convention as Python), `typedef struct {...} doa_tracker_t; void doa_tracker_init(doa_tracker_t *t, float spacing_m); int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *lag_out); void doa_tracker_episode(const doa_tracker_t *t, doa_episode_t *out);` with `doa_episode_t { int side; float lag_samples, lag_ms, conf; int n_valid; }` and side codes 0 unknown, 1 left, 2 right.
+- Parity contract: per frame, lag within 0.05 samples and the validity decision equal; per episode, side and `n_valid` exact, `lag_samples` within 0.05, `conf` within 1e-6.
 
-- [ ] **Step 1: Write the host test**
+- [ ] **Step 1: Write the host test and extend the pytest wrapper**
 
 `esp32_firmware/v5/host_test/test_doa.c`:
 ```c
-/* Usage: test_doa <doa_cases.bin>. Lag must agree within 0.05 samples; the validity decision (ratio >= 1.5) must agree. */
+/* Usage: test_doa <doa_cases.bin> <doa_tracker.bin>. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include "doa_gccphat.h"
 
-int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s doa_cases.bin\n", argv[0]); return 2; }
-    FILE *fh = fopen(argv[1], "rb");
-    if (!fh) { perror("open"); return 2; }
+static void to_float(const int16_t *in, float *out) { for (int n = 0; n < 512; n++) out[n] = (float)in[n] / 32768.0f; }
+
+static int run_cases(const char *path) {
+    FILE *fh = fopen(path, "rb");
+    if (!fh) { perror("open cases"); return 1; }
     int32_t hdr[3];
-    if (fread(hdr, sizeof(int32_t), 3, fh) != 3 || hdr[1] != 512) { fprintf(stderr, "bad header\n"); return 2; }
-    int max_lag = hdr[2], failures = 0;
+    if (fread(hdr, sizeof(int32_t), 3, fh) != 3 || hdr[1] != 512) { fprintf(stderr, "bad cases header\n"); return 1; }
+    int failures = 0;
     int16_t li[512], ri[512];
     float l[512], r[512], expect[2];
     for (int c = 0; c < hdr[0]; c++) {
-        if (fread(li, sizeof(int16_t), 512, fh) != 512 || fread(ri, sizeof(int16_t), 512, fh) != 512 || fread(expect, sizeof(float), 2, fh) != 2) return 2;
-        for (int n = 0; n < 512; n++) { l[n] = (float)li[n] / 32768.0f; r[n] = (float)ri[n] / 32768.0f; }
+        if (fread(li, sizeof(int16_t), 512, fh) != 512 || fread(ri, sizeof(int16_t), 512, fh) != 512 || fread(expect, sizeof(float), 2, fh) != 2) return 1;
+        to_float(li, l);
+        to_float(ri, r);
         float lag, ratio;
-        doa_gcc_phat(l, r, max_lag, 60.0f, 3000.0f, &lag, &ratio);
+        doa_gcc_phat(l, r, hdr[2], 60.0f, 3000.0f, &lag, &ratio);
         int ok = fabsf(lag - expect[0]) <= 0.05f && ((ratio >= 1.5f) == (expect[1] >= 1.5f));
         printf("case %d: lag %.3f (ref %.3f) ratio %.2f (ref %.2f) %s\n", c, lag, expect[0], ratio, expect[1], ok ? "ok" : "MISMATCH");
         if (!ok) failures++;
     }
     fclose(fh);
-    printf("doa parity: %d cases, %d failing\n", hdr[0], failures);
+    return failures;
+}
+
+static int run_tracker(const char *path) {
+    FILE *fh = fopen(path, "rb");
+    if (!fh) { perror("open tracker"); return 1; }
+    int32_t hdr[2];
+    float spacing;
+    if (fread(hdr, sizeof(int32_t), 2, fh) != 2 || fread(&spacing, sizeof(float), 1, fh) != 1 || hdr[1] != 512) { fprintf(stderr, "bad tracker header\n"); return 1; }
+    doa_tracker_t t;
+    doa_tracker_init(&t, spacing);
+    int16_t li[512], ri[512];
+    float l[512], r[512], exp_lag;
+    int32_t exp_valid;
+    int failures = 0;
+    for (int k = 0; k < hdr[0]; k++) {
+        if (fread(li, sizeof(int16_t), 512, fh) != 512 || fread(ri, sizeof(int16_t), 512, fh) != 512 || fread(&exp_valid, sizeof(int32_t), 1, fh) != 1 || fread(&exp_lag, sizeof(float), 1, fh) != 1) return 1;
+        to_float(li, l);
+        to_float(ri, r);
+        float lag;
+        int valid = doa_tracker_frame(&t, l, r, &lag);
+        if (valid != exp_valid || fabsf(lag - exp_lag) > 0.05f) {
+            if (failures < 10) printf("frame %d: valid %d (ref %d) lag %.3f (ref %.3f) MISMATCH\n", k, valid, exp_valid, lag, exp_lag);
+            failures++;
+        }
+    }
+    int32_t side, n_valid;
+    float ep_ref[3];
+    if (fread(&side, sizeof(int32_t), 1, fh) != 1 || fread(ep_ref, sizeof(float), 3, fh) != 3 || fread(&n_valid, sizeof(int32_t), 1, fh) != 1) return 1;
+    fclose(fh);
+    doa_episode_t ep;
+    doa_tracker_episode(&t, &ep);
+    int ok = ep.side == side && ep.n_valid == n_valid && fabsf(ep.lag_samples - ep_ref[0]) <= 0.05f && fabsf(ep.conf - ep_ref[2]) <= 1e-6f;
+    printf("tracker episode: side %d (ref %d) lag %.3f (ref %.3f) conf %.4f (ref %.4f) n_valid %d (ref %d) %s\n", ep.side, side, ep.lag_samples, ep_ref[0], ep.conf, ep_ref[2], ep.n_valid, n_valid, ok ? "ok" : "MISMATCH");
+    return failures + (ok ? 0 : 1);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: %s doa_cases.bin doa_tracker.bin\n", argv[0]); return 2; }
+    int failures = run_cases(argv[1]) + run_tracker(argv[2]);
+    printf("doa parity: %d failing checks\n", failures);
     return failures ? 1 : 0;
 }
+```
+
+Replace the fsm test in `tests/test_c_parity.py` with one aggregate test (keep the features test):
+```python
+@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+def test_c_fsm_and_doa_match_python(tmp_path):
+    golden = tmp_path / "golden"
+    X.write_headers_only(FW / "generated", golden, FsmParams(), DoaParams())
+    _synthetic_golden(golden)
+    _run("test", golden)
 ```
 
 - [ ] **Step 2: Implement the module**
@@ -4760,53 +5236,47 @@ void doa_tracker_episode(const doa_tracker_t *t, doa_episode_t *out) {
 }
 ```
 
-- [ ] **Step 3: Build and run all host tests, then the pytest wrapper**
+- [ ] **Step 3: Build and run all host tests through the pytest wrapper**
 
-Run: `make -C esp32_firmware/v5 test GOLDEN=$(pwd)/output/v5/deliverables/golden` (features.bin there comes from Task 24; until then use the `/tmp/v5golden` directory from Task 21 after copying `fsm_trace.txt` and `doa_cases.bin` into it) and `.venv-mac/bin/python -m pytest tests/test_c_parity.py -v`
-Expected: `doa parity: 10 cases, 0 failing`, all three tests exit 0; pytest PASS.
+Run: `.venv-mac/bin/python -m pytest tests/test_c_parity.py -v`
+Expected: PASS; make output ends with `doa parity: 0 failing checks`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add esp32_firmware/v5/doa_gccphat.h esp32_firmware/v5/doa_gccphat.c esp32_firmware/v5/host_test/test_doa.c
-git commit -m "feat(fw-v5): GCC-PHAT direction module in C with golden-case test"
+git add esp32_firmware/v5/doa_gccphat.h esp32_firmware/v5/doa_gccphat.c esp32_firmware/v5/host_test/test_doa.c tests/test_c_parity.py
+git commit -m "feat(fw-v5): GCC-PHAT direction module in C with golden-case and tracker tests"
 ```
-
----
-
-### Task 24: Export the deployed model, run the streaming benchmark and DoA sweep, finish the model card
+### Task 24: Gated export, benchmarks, DoA sweep, model card
 
 **Files:**
 - Create/update (tracked): `esp32_firmware/v5/generated/*`, `output/v5/deliverables/*`
 
-- [ ] **Step 1: Streaming benchmark and DoA sweep**
+- [ ] **Step 1: Export through the gates (the only evaluation on the test split)**
+
+Run: `.venv-mac/bin/python -m v5.export model`
+Expected: JSON summary with `parity.passed: true` and float/int8 test metrics; `output/v5/deliverables/export_status.json` says `ok`; `esp32_firmware/v5/generated/model_data.c` is a few hundred KB. An `ExportError` leaves `output/v5/export_stage/` for diagnosis and records `failed` in `export_status.json`; do not hand-copy anything out of the stage directory.
+
+- [ ] **Step 2: Streaming benchmark on both paths and the DoA sweep**
 
 Run:
 ```bash
 .venv-mac/bin/python -m v5.benchmark_nights
 .venv-mac/bin/python -m v5.doa_sim --trials 50
 ```
-Expected: `deliverables/benchmark_nights.md` with a row per SNR; `deliverables/doa_sim.md` with 48 rows. Record in the commit message whether the provisional targets (detection ≥ 0.90, false confirms ≤ 0.5/h at SNR ≥ 5 dB, DoA ≥ 0.95 at 0.06 m, 1 m, SNR ≥ 5 dB) were met.
+Expected: `deliverables/benchmark_nights.md` with a table per predictor (int8 is the product path) and the float~int8 tick decision agreement; `deliverables/doa_sim.md` with 48 rows. Record in the commit message whether the provisional targets (int8 detection ≥ 0.90, false confirms ≤ 0.5/h at SNR ≥ 5 dB, DoA ≥ 0.95 at 0.06 m, 1 m, SNR ≥ 5 dB) were met.
 
-- [ ] **Step 2: Export**
+- [ ] **Step 3: Model card, host C tests against the real golden set, full test suite**
 
-Run: `.venv-mac/bin/python -m v5.export model`
-Expected: JSON summary with `parity.passed: true`; `output/v5/deliverables/model_card.md` includes every table; `esp32_firmware/v5/generated/model_data.c` is a few hundred KB.
-
-- [ ] **Step 3: Host C tests against the real golden set and the full test suite**
-
-Run: `make -C esp32_firmware/v5 test && .venv-mac/bin/python -m pytest -q`
-Expected: three host tests exit 0; pytest reports all passed (dataset tests included, slow ones may take a few minutes).
+Run: `.venv-mac/bin/python -m v5.export card && make -C esp32_firmware/v5 test && .venv-mac/bin/python -m pytest -q`
+Expected: `deliverables/model_card.md` includes every table; three host tests exit 0; pytest reports all passed (dataset tests included; slow ones may take a few minutes).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add esp32_firmware/v5/generated output/v5/deliverables
-git commit -m "release(v5): int8 model, C headers, golden vectors, benchmark, DoA sweep and model card"
+git commit -m "release(v5): gated int8 model, C headers, golden vectors, benchmarks, DoA sweep and model card"
 ```
-
----
-
 ### Task 25: Self-recording kit
 
 **Files:**
@@ -4998,7 +5468,6 @@ git commit -m "feat(v5): self-recording kit with chunked WAV writer and label te
 ```
 
 ---
-
 ### Task 26: Fine-tuning recipe on self-recordings
 
 **Files:**
@@ -5042,6 +5511,20 @@ def _session(dir_, seed):
 def test_slice_session_counts_and_labels(tmp_path):
     audio, y = FT.slice_session(_session(tmp_path / "a", 0))
     assert audio.shape == (40, F.WIN) and audio.dtype == np.int16 and y.sum() == 20
+
+
+def test_holdout_and_overlap_are_rejected(tmp_path):
+    import pytest
+
+    a = _session(tmp_path / "a", 3)
+    model = build_model(0.5)
+    model.save(tmp_path / "m.keras")
+    with pytest.raises(ValueError):
+        FT.finetune(tmp_path / "m.keras", [a], a, tmp_path / "out", epochs=1)
+    with open(a / "labels.csv", "a", newline="") as fh:
+        csv.writer(fh).writerow(["chunk_0000.wav", "5", "8", "speech", "", "", "0.8", "thin"])  # overlaps the snore span
+    with pytest.raises(ValueError):
+        FT.load_labels(a)
 
 
 def test_finetune_smoke(tmp_path):
@@ -5096,6 +5579,14 @@ def load_labels(session_dir) -> list[dict]:
     bad = [r["label"] for r in rows if r["label"] not in LABEL_TO_Y]
     if bad:
         raise ValueError(f"unknown labels {sorted(set(bad))}; allowed: {sorted(LABEL_TO_Y)}")
+    by_chunk: dict[str, list] = {}
+    for r in rows:
+        by_chunk.setdefault(r["chunk"], []).append((float(r["start_s"]), float(r["end_s"]), r["label"]))
+    for chunk, spans in by_chunk.items():
+        spans.sort()
+        for (s1, e1, l1), (s2, e2, l2) in zip(spans, spans[1:]):
+            if s2 < e1:
+                raise ValueError(f"overlapping spans in {chunk}: [{s1}, {e1}] {l1} and [{s2}, {e2}] {l2}")
     return rows
 
 
@@ -5120,6 +5611,8 @@ def slice_session(session_dir, hop_s: float = 1.0):
 
 
 def finetune(model_path, sessions, holdout, out_dir, epochs: int = 10, lr: float = 1e-4, tau: float = 0.65, seed: int = 42) -> dict:
+    if any(Path(s).resolve() == Path(holdout).resolve() for s in sessions):
+        raise ValueError("the holdout session must not be one of the training sessions")
     parts = [slice_session(s) for s in sessions]
     audio, y = np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
     h_audio, h_y = slice_session(holdout)
@@ -5158,7 +5651,7 @@ def main(argv=None) -> None:
     cfg = resolve(load_config(args.config))
     out_root = Path(cfg["paths"]["out_dir"])
     thr = out_root / "threshold.json"
-    tau = json.loads(thr.read_text())["tau"] if thr.exists() else float(cfg["threshold"]["fallback"])
+    tau = json.loads(thr.read_text())["tau"] if thr.exists() else 0.65  # no calibration yet: development default
     m = finetune(args.model or out_root / "deployed" / "model.keras", args.sessions, args.holdout,
                  args.out or out_root / "finetune" / date.today().strftime("%Y%m%d"), args.epochs, tau=tau, seed=cfg["seed"])
     print(json.dumps({k: m[k] for k in ("model_version", "n_train", "n_holdout")}), "\nbefore:", json.dumps(m["before"]), "\nafter:", json.dumps(m["after"]))
@@ -5181,7 +5674,6 @@ git commit -m "feat(v5): fine-tuning recipe for self-recorded sessions"
 ```
 
 ---
-
 ### Task 27: Final verification and handoff README
 
 **Files:**
@@ -5210,18 +5702,21 @@ Spec: `docs/superpowers/specs/2026-09-04-snore-v5-edge-pipeline-design.md`
     uv venv .venv-mac --python 3.12
     uv pip install --python .venv-mac/bin/python tensorflow tensorflow-hub librosa soundfile soxr scikit-learn scipy pyroomacoustics ai-edge-litert sounddevice pyyaml pytest pydantic "setuptools<81"
 
+Splits: train / val (selection) / calib (threshold) / test (Kaggle, evaluated once at export) / bench (MS-SNSD beds). Release gates in `v5.export` block promotion on int8 parity or operator failures; calibration fails closed on the FPR target.
+
 ## Pipeline, in order
 
     .venv-mac/bin/python -m v5.data.manifest            # decode, dedup, split -> output/v5/manifest.csv
     .venv-mac/bin/python -m v5.teacher                  # optional YAMNet soft labels + label audit
-    .venv-mac/bin/python -m v5.train run --protocol A --width 1.0 --name A_hard_w1
-    .venv-mac/bin/python -m v5.train run --protocol A --width 1.0 --kd --name A_kd_w1
-    .venv-mac/bin/python -m v5.train run --protocol A --width 2.0 --name A_hard_w2
-    .venv-mac/bin/python -m v5.train run --protocol A --width 2.0 --kd --name A_kd_w2
-    .venv-mac/bin/python -m v5.train select && .venv-mac/bin/python -m v5.train final
-    .venv-mac/bin/python -m v5.benchmark_nights         # synthetic nights -> product metrics
+    .venv-mac/bin/python -m v5.train run --width 1.0 --name hard_w1
+    .venv-mac/bin/python -m v5.train run --width 1.0 --kd --name kd_w1
+    .venv-mac/bin/python -m v5.train run --width 2.0 --name hard_w2
+    .venv-mac/bin/python -m v5.train run --width 2.0 --kd --name kd_w2
+    .venv-mac/bin/python -m v5.train select && .venv-mac/bin/python -m v5.train final   # select on val, calibrate on calib
+    .venv-mac/bin/python -m v5.export model             # gated: int8 tflite, C headers, golden vectors; the only test-split evaluation
+    .venv-mac/bin/python -m v5.benchmark_nights         # synthetic nights, float and int8 paths
     .venv-mac/bin/python -m v5.doa_sim --trials 50      # direction accuracy vs mic spacing
-    .venv-mac/bin/python -m v5.export model             # int8 tflite, C headers, golden vectors, model card
+    .venv-mac/bin/python -m v5.export card              # model card from the gated artifacts
     make -C esp32_firmware/v5 test                       # C parity against the golden vectors
     .venv-mac/bin/python -m pytest
 

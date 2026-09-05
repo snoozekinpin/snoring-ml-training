@@ -99,14 +99,14 @@ max |ΔX| ≤ 5e-3 before quantisation; after quantisation at most ±1 LSB on �
 
 ### 4.1 Sources
 
-| id | path | label | group key | role |
+| id | path | label | group key | split |
 |---|---|---|---|---|
-| kaggle_adria | `dataset/adrianagaler/{snore,noise}` | folder | near-dup cluster id (protocol B); whole source (protocol A) | cross-domain test |
-| kaggle_jibran | `dataset/snoring_extra/jibran/jibran_{s,n}_*` | filename | same as above | cross-domain test |
-| whl_s | `dataset/whltalent/s*/` 834 raw 10 s recordings | snore | recording file | train/val |
-| whl_e | `dataset/whltalent/e*/` 1520 raw 10 s recordings | noise | recording file | train/val |
-| esc50 | `dataset/esc50/audio` 2000 × 5 s @ 44.1 kHz + `meta/esc50.csv` | category `snoring` → snore, all other categories → noise | fold 1–5 (fold 5 = val) | train/val |
-| mssnsd | `dataset/RAW/MS-SNSD/noise_train` 128 files | noise | file; category from filename prefix | train/val by file; 20 % of files (seeded, 42) held out as benchmark noise beds and never used for training or augmentation |
+| kaggle_adria | `dataset/adrianagaler/{snore,noise}` | folder | file | test (immutable; evaluated once by the exporter) |
+| kaggle_jibran | `dataset/snoring_extra/jibran/jibran_{s,n}_*` | filename | file | test |
+| whl_s | `dataset/whltalent/s*/` 834 raw 10 s recordings | snore | `whl_<batch>_<stem>`; batch = file-name prefix | train, except batch `000002` → val |
+| whl_e | `dataset/whltalent/e*/` 1520 raw 10 s recordings | noise | same | train, except batch `100002` → val |
+| esc50 | `dataset/esc50/audio` 2000 × 5 s @ 44.1 kHz + `meta/esc50.csv` | category `snoring` → snore, all other categories → noise | official fold | folds 1–3 train, fold 4 val, fold 5 calib |
+| mssnsd | `dataset/RAW/MS-SNSD/noise_train` 128 files | noise | file; category from filename prefix | 20 % of files bench (seeded 42), remaining files 70/15/15 train/val/calib |
 | wild | `Snore_Detection_Project/.../inference_audios/snore{1..6}.wav` | snore | file | sanity listing only, no metrics |
 
 Excluded on purpose: `dataset/snore/synth_*` (synthetic), the pre-sliced `dataset/snore`,
@@ -139,17 +139,28 @@ levels. Per-window RMS uses 32 ms frames.
    shares a cluster with a training window, the test/validation window is dropped. Counts of
    dropped windows are written to `output/v5/manifest_report.md`.
 
-### 4.4 Splits
+### 4.4 Split (immutable, deterministic)
 
-- Protocol A (cross-domain): test = all Kaggle windows. Train/val from the other sources with a
-  group-stratified 85/15 split (WHLTalent recording, ESC-50 fold 5 as val, MS-SNSD file).
-- Protocol B (deployment): Kaggle joins train/val using `dup_cluster` as its group; same 85/15
-  group split.
-- Both protocols assert zero group overlap and zero cluster overlap between splits.
+One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity`, `drop`:
+
+- `train`: WHLTalent batches other than the validation batches, ESC-50 folds 1–3, MS-SNSD training files.
+- `val` (early stopping and model selection): WHLTalent batches `000002` (snore) and `100002`
+  (environment), ESC-50 fold 4, 15 % of the non-bench MS-SNSD files.
+- `calib` (threshold calibration only): ESC-50 fold 5, 15 % of the non-bench MS-SNSD files.
+- `test` (final evaluation, used exactly once by the exporter): the whole Kaggle set. It is never
+  used for training, selection, calibration, augmentation banks or synthetic-night material.
+- `bench`: 20 % of MS-SNSD files (seeded 42), used only as benchmark noise beds and robustness noise.
+- Eval windows whose near-duplicate cluster contains a training window are dropped; clusters with
+  conflicting labels are dropped everywhere. Invariants: no group and no cluster may appear in
+  `train` and any evaluation partition; minimum window counts per partition are enforced and a
+  shortfall aborts the build.
+- Leakage statement: WHLTalent has no subject metadata, so the split is batch-disjoint (file-name
+  prefix) rather than proven subject-disjoint; ESC-50's official folds keep same-source clips
+  together; Kaggle is a separate collection.
 - Class balance: batches are sampled 1:2 positive:negative; loss is unweighted.
 
-Expected volumes (protocol A): ≈ 2.6 k positive and ≈ 10 k negative windows for training,
-≈ 1 k Kaggle test windows after dedup.
+Expected volumes: ≈ 2 k positive and ≈ 6 k negative training windows, ≈ 470 validation positives,
+≥ 1 k calibration negatives, ≈ 1 k Kaggle test windows after dedup.
 
 ### 4.5 Label audit (only when the teacher is available)
 
@@ -199,35 +210,40 @@ Teacher logit `z = logit(P(Snoring) + P(Snort))` on the clean window is Platt-ca
 training split (`t = σ(a z + b)` fitted against folder labels), cached per window, and used as a
 soft target for every augmented view of that window: `loss = 0.5·BCE(y) + 0.5·BCE(t)`.
 
-Selection rule (protocol A, Kaggle test): compare {hard-label, KD} × {width 1.0, width 2.0} and
-pick the smallest configuration whose AUC is within 0.005 of the best and whose recall at
-2 % false-positive rate is within 2 points of the best. Retrain that configuration under
-protocol B for deployment.
+Selection rule (validation split): compare {hard-label, KD} × {width 1.0, width 2.0} and pick the
+smallest configuration whose validation AUC is within 0.005 of the best and whose validation recall
+at 2 % false-positive rate is within 2 points of the best. The selected run's weights are deployed
+as they are; there is no refit on more data, so the test evaluation applies to the deployed weights.
 
-Threshold τ: on the protocol B validation split, the smallest τ with clip-level FPR ≤ 1 %;
-fallback 0.65 if fewer than 200 negatives are available. Written to `output/v5/threshold.json`
-together with the FSM parameters of section 8 and `model_version = "cnn_v5_int8"`.
-The version string must never contain `simulator`, `demo` or `mock`; the cloud treats such
-events as simulated data.
+Threshold τ (calibration split): the smallest float strictly above the largest negative score that
+may still pass, so at most ⌊max_fpr · n_neg⌋ calibration negatives score at or above τ (max_fpr
+1 %). Calibration fails closed: fewer than 300 calibration negatives, no finite τ ≤ 1, or zero
+positive recall raise an error and nothing is deployed. `threshold.json` records τ, the measured
+calibration FPR with its 95 % Clopper–Pearson upper bound, recall, the FSM parameters of section 8
+and `model_version = "cnn_v5_int8"`. The version string must never contain `simulator`, `demo` or
+`mock`; the cloud treats such events as simulated data.
 
 ## 7. Evaluation and acceptance
 
-Clip level (`evaluate.py`), reported for validation, Kaggle test, and Kaggle test under
-robustness sweeps (SNR 20/10/5/0 dB with held-out MS-SNSD beds; RIR at 0.5/1.0/1.5 m):
-AUC, recall at 2 % FPR, precision/recall/FNR/FPR at τ, confusion matrix.
+Development metrics (`evaluate.py`) on the validation split drive selection. The test split is
+evaluated exactly once, by the exporter, for both the float model and the int8 model: AUC, recall
+at 2 % FPR, precision/recall/FNR/FPR at τ, confusion matrix; plus robustness sweeps of the float
+model (SNR 20/10/5/0 dB with bench MS-SNSD windows; RIR at 0.5/1.0/1.5 m).
 
-Int8 parity: fp32 vs int8 probabilities on the test set; pass if ΔAUC < 0.005 and decision
-agreement at τ ≥ 99 %.
+Int8 parity gate (test split): ΔAUC < 0.005, decision agreement at τ ≥ 99 %, max |Δp| ≤ 0.05.
+Failure blocks the release.
 
-Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded.
-Each night = held-out MS-SNSD noise bed at −50…−30 dBFS, optional RIR, 6–12 snore episodes of
-20–120 s built from WHLTalent snore windows of the protocol B validation split (never trained
-on) with burst period 2.5–5 s and breathing gaps, plus 20–40 distractor events (speech, cough,
-door, typing, vacuum from validation-split negative windows). Ground truth = episode intervals. The pipeline runs features → model → FSM at 2 Hz.
-Metrics: episode detection rate, confirm latency (episode start → CONFIRMED), false confirms per
-hour (CONFIRMED outside any episode ± 5 s), snore-stop latency (true episode end → the FSM's
-`active` flag drops, which is the signal the intervention loop uses; the bookkeeping
-`episode_end` event follows verify_window_seconds later and is reported separately).
+Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
+test-split snore and distractor windows over bench MS-SNSD beds at −50…−30 dBFS, optional 1 m RIR,
+6–12 snore episodes of 20–120 s with burst period 2.5–5 s and breathing gaps, 20–40 distractor
+events. The pipeline runs features → predictor → FSM at 2 Hz for both the float model and the
+deployed int8 model; product metrics come from the int8 path and the tick-level decision agreement
+between the two is reported. Scoring matches episode_start events one-to-one and chronologically
+to episodes whose window [start − 5 s, end + 5 s] contains the event time; unmatched events are
+false confirms and unmatched episodes are misses. Metrics: detection rate, confirm latency
+(max(0, event − start)), false confirms per hour, snore-stop latency (true episode end → the FSM's
+`active` flag drops, the signal the intervention loop uses), and the delay of the bookkeeping
+`episode_end` event.
 
 Provisional targets, reported not promised: detection ≥ 90 %, confirm latency ≤ confirm_seconds
 + 3 s, false confirms ≤ 0.5 per hour at SNR ≥ 5 dB. Results at all SNRs go into the model card
@@ -252,6 +268,8 @@ with probability `p`.
   `verify_window_seconds` (emit `episode_end` with duration, mean p over hits, burst count,
   level in dBFS); ACTIVE → IDLE when streak returns to 0. The FSM also exposes `active` every
   tick; the firmware stops vibrating as soon as `active` is false while CONFIRMED.
+- episode statistics (`mean_p`, `n_hits`, `level_dbfs`) cover every hit from the first retained
+  burst onward, including hits before confirmation; Python and C keep the same pruned hit history.
 - all timing is integer tick arithmetic (tick = 0.5 s; streak counted in half-ticks: +2 per
   active tick, −1 per inactive tick) so the Python reference and the C code agree exactly.
 
@@ -294,25 +312,43 @@ cloud repo's pydantic `EventIn` when that repo is present on disk (skipped other
 
 ## 11. Export and firmware contract
 
-`export.py` produces under `output/v5/deliverables/`:
+`export.py` writes everything into `output/v5/export_stage/` first and promotes it only after every
+release gate passes: TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
+set is within {CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED, LOGISTIC, RESHAPE, QUANTIZE,
+DEQUANTIZE}; int8 parity on the test split meets the limits of section 7. A failed gate raises,
+keeps the stage directory for diagnosis, records `failed` in `deliverables/export_status.json` and
+leaves previously promoted files untouched. Promoted files under `output/v5/deliverables/`:
 
 - `snore_v5_int8.tflite` (full-integer, int8 in/out, representative set of 500 training windows)
-- `model_data.h` (`alignas(16) const unsigned char snore_v5_int8_tflite[]`, length macro)
-- `model_meta.h` (INPUT_SCALE, INPUT_ZERO_POINT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, THRESHOLD,
-  MODEL_VERSION, FEATURE_SPEC_VERSION, FSM parameters)
-- `mel_filterbank.h`, `feature_spec.h`, `golden/` (features, FSM traces, DoA stereo cases)
-- `model_card.md` (data volumes, dedup counts, every table from section 7 and 9, int8 parity)
+- `model_data.h` / `model_data.c` (`const unsigned char snore_v5_int8_tflite[]` aligned 16, length)
+- `model_meta.h` (INPUT_SCALE, INPUT_ZERO_POINT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, SNORE_THRESHOLD,
+  MODEL_VERSION, FEATURE_SPEC_VERSION, FSM parameters), `mel_filterbank.h`, `feature_spec.h`
+- `export_info.json`, `export_status.json`, `test_metrics.json`, `robustness.json`
+- `golden/` (features with quantised copies, FSM trace with end-event fields, DoA frame cases and a
+  tracker sequence)
+- `model_card.md`, assembled by `export card` after the benchmark and the DoA sweep; it contains the
+  single test evaluation, the parity gate, robustness, calibration, an activation-memory estimate
+  and the call sequence. Desktop tests establish numerical parity, not ESP32-S3 deployability: the
+  firmware build must still verify the TFLM operator resolver, the real tensor arena and flash use.
 
 C sources under `esp32_firmware/v5/` (C99, no malloc, no dependencies beyond libm):
 
-- `fft512.c/.h` radix-2 real FFT reference (firmware may substitute esp-dsp; both must pass the
-  golden tolerance)
+- `fft512.c/.h` radix-2 complex FFT reference (firmware may substitute esp-dsp; both must pass the
+  host tests)
 - `snore_features.c/.h`: `sf_compute(const int16_t win[16000], float X[61*30])` and
   `sf_quantize(const float X[], int8_t q[], float scale, int zp)`
-- `snore_episode_fsm.c/.h`: `fsm_init(params)`, `fsm_tick(p) -> event`
-- `doa_gccphat.c/.h`: `doa_frame(l[512], r[512]) -> lag, valid`, `doa_episode_*` aggregation
-- `host_test/Makefile` + `test_features.c`, `test_fsm.c`, `test_doa.c` reading the golden files;
-  `make test` exits non-zero on any mismatch. A pytest wrapper runs it when a C compiler exists.
+- `snore_episode_fsm.c/.h`: `fsm_init(params)`, `fsm_tick(p, level) -> event`, readable last-episode
+  fields (duration, mean probability, burst and hit counts, level)
+- `doa_gccphat.c/.h`: `doa_gcc_phat(l[512], r[512]) -> lag, ratio`, `doa_tracker_*`
+- `host_test/` with `test_features.c`, `test_fsm.c`, `test_doa.c` and Makefile targets
+  `test-features`, `test-fsm`, `test-doa`, `test`; each exits non-zero on any mismatch and pytest
+  runs them when a C compiler exists.
+
+Parity contract (numerical, not bit-exact): float features within 5e-3 of the Python float64
+reference on every cell, quantised features never off by more than 1 LSB and off by exactly 1 LSB on
+at most 1 % of cells; FSM state, active flag and event code exactly equal on every tick, end-event
+fields within 1e-3 s / 1e-4 / exact counts / 1e-3 dB; DoA lag within 0.05 samples with identical
+validity, side, hit count and confidence.
 
 The TFLite Micro invoke glue in the existing `snore_detector_ml.c` is Arthur's; the model card
 documents the call sequence (window → `sf_compute` → `sf_quantize` → invoke → dequantise →
@@ -333,12 +369,21 @@ frozen, reports before/after metrics on the held-out session, and exports with
 
 ## 13. Error handling and degraded modes
 
-- Undecodable or empty audio: skipped, listed in `output/v5/manifest_errors.csv`.
+- Missing dataset root, missing required source (WHLTalent, ESC-50, MS-SNSD) or a window count
+  below the configured minimum: the manifest build raises `DatasetMissing`; nothing is written as if
+  it had succeeded. Optional sources (Kaggle, wild) and undecodable files are logged in
+  `output/v5/manifest_errors.csv`.
 - Teacher unavailable (no network, hub failure): KD and the label audit are disabled, a warning is
-  printed, and the model card states that hard labels only were used.
+  printed, and the run metrics record that hard labels only were used.
+- Calibration that cannot meet the FPR target: `CalibrationError`; no model is deployed and no
+  `threshold.json` is written.
+- Export gate failure (dtype, shape, operator set, parity): `ExportError`; the stage directory is
+  kept, `export_status.json` records the failure, no artifact is promoted, and `export card` refuses
+  to build a model card from a failed export.
 - No C compiler: C parity tests are skipped with an explicit skip reason; never a silent pass.
-- TFLite conversion failure: export fails loudly; there is no float fallback artifact.
-- Dataset directory missing: dataset-marked tests skip; unit tests use generated audio.
+- Dataset directory missing on a development machine: dataset-marked tests skip; unit tests use
+  generated audio. When the dataset is present, the release gate test fails (does not skip) if the
+  manifest has not been built.
 
 ## 14. Testing
 
