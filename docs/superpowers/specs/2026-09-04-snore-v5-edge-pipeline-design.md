@@ -130,8 +130,10 @@ levels. Per-window RMS uses 32 ms frames.
 
 ### 4.3 Deduplication
 
-1. Exact: md5 of the decoded int16 mono 16 kHz window; duplicates dropped, keeping the first by
-   source priority (whl, esc50, mssnsd, kaggle_adria, kaggle_jibran).
+1. Exact: md5 of the decoded int16 mono 16 kHz window. Every decoded window is kept until the
+   split is assigned; then copies with conflicting labels are dropped everywhere, otherwise exactly
+   one copy survives in the highest-priority partition among the copies (`test` first) and the rest
+   are dropped, so a Kaggle test window is never replaced by its training twin.
 2. Near: fingerprint = feature X flattened and standardised; cosine ≥ 0.98 joins two windows in
    one cluster (union-find over a blocked similarity matrix). Every window carries its
    `dup_cluster` id.
@@ -153,9 +155,9 @@ One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity
   recording-disjoint from `val`) plus 20 % of MS-SNSD files (seeded 42). This is the only material
   for the streaming benchmark and the DoA sweep, and the MS-SNSD part supplies noise beds and
   robustness noise.
-- Isolation: every group and every near-duplicate cluster lives in exactly one partition; when one
-  spans several, it stays in the highest-priority partition (`test`, `train`, `val`, `calib`, `bench`)
-  and is dropped from the others, so the test set is never altered by the other partitions.
+- Isolation: every waveform, group and near-duplicate cluster lives in exactly one partition; when
+  one spans several, it stays in the highest-priority partition (`test`, `train`, `val`, `calib`,
+  `bench`) and is dropped from the others, so the test set is never altered by the other partitions.
   Clusters with conflicting labels and exact-duplicate waveforms with conflicting labels are dropped
   everywhere. Minimum window counts per partition are enforced and a shortfall aborts the build.
 - The test split is readable only by the exporter (`split_indices(..., allow_test=True)`); every
@@ -224,9 +226,10 @@ as they are; there is no refit on more data, so the test evaluation applies to t
 Threshold τ (calibration split): the smallest float strictly above the largest negative score that
 may still pass, so at most ⌊max_fpr · n_neg⌋ calibration negatives score at or above τ (max_fpr
 1 %). Calibration fails closed: fewer than 300 calibration negatives, no finite τ ≤ 1, or zero
-positive recall raise an error and nothing is deployed. `threshold.json` records τ, the measured
-calibration FPR with its 95 % Clopper–Pearson upper bound, recall, the FSM parameters of section 8
-and `model_version = "cnn_v5_int8"`. The version string must never contain `simulator`, `demo` or
+positive recall raise an error and nothing is deployed. `threshold.json` records τ, the SHA-256 of the
+deployed model file (the exporter refuses a model that does not match), the measured calibration
+FPR with its 95 % Clopper–Pearson upper bound, recall, the FSM parameters of section 8 and
+`model_version = "cnn_v5_int8"`. The version string must never contain `simulator`, `demo` or
 `mock`; the cloud treats such events as simulated data.
 
 ## 7. Evaluation and acceptance
@@ -234,13 +237,14 @@ and `model_version = "cnn_v5_int8"`. The version string must never contain `simu
 Development metrics (`evaluate.py`) on the validation split drive selection. The test split is
 evaluated exactly once, by the exporter, for both the float model and the int8 model: AUC, recall
 at 2 % FPR, precision/recall/FNR/FPR at τ, confusion matrix; plus robustness sweeps of the float
-model (SNR 20/10/5/0 dB with bench MS-SNSD windows; RIR at 0.5/1.0/1.5 m).
+model (SNR 20/10/5/0 dB with bench MS-SNSD negative windows only; RIR at 0.5/1.0/1.5 m).
 
 Int8 parity gate (test split): ΔAUC < 0.005, decision agreement at τ ≥ 99 %, max |Δp| ≤ 0.05.
 Failure blocks the release.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
-bench-partition snore and distractor windows over bench MS-SNSD beds at −50…−30 dBFS, optional 1 m RIR,
+bench-partition snore and distractor windows over beds made only from bench MS-SNSD negative files
+at −50…−30 dBFS, optional 1 m RIR,
 6–12 snore episodes of 20–120 s with burst period 2.5–5 s and breathing gaps, 20–40 distractor
 events. The pipeline runs features → predictor → FSM at 2 Hz for both the float model and the
 deployed int8 model; product metrics come from the int8 path and the tick-level decision agreement
@@ -322,7 +326,9 @@ cloud repo's pydantic `EventIn` when that repo is present on disk (skipped other
 `export.py` writes everything into `output/v5/export_stage/` first and promotes it only after every
 release gate passes. Promotion is transactional: complete sibling trees for `deliverables/` and
 `generated/` are built, then both are swapped in by rename with backups kept until both swaps
-succeed; any failure restores both previous trees. Gates: TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
+succeed; any failure restores both previous trees. The successful `export_status.json` is written
+into the stage and travels inside the swap, and post-swap cleanup is best-effort. Gates (checked
+after the threshold/model SHA-256 binding): TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
 set is within {CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED, LOGISTIC, RESHAPE, QUANTIZE,
 DEQUANTIZE}; int8 parity on the test split meets the limits of section 7. A failed gate raises,
 keeps the stage directory for diagnosis, records `failed` in `deliverables/export_status.json` and

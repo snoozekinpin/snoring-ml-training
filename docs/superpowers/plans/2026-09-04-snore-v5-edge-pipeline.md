@@ -969,11 +969,11 @@ git commit -m "feat(v5): source decoding and one-second window slicing"
 
 **Interfaces:**
 - Consumes: `v5.data.sources` (`iter_windows`, `SOURCE_IDS`, `TEST_SOURCES`), `v5.features` (`float_to_int16`, `extract_int16`).
-- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `PARTITIONS` (`test, train, val, calib, bench` in priority order), `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `class TestSplitAccess(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `cache_fingerprint(data_dir, data_cfg) -> str`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]`, `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `load_exact_conflicts(out_dir) -> list[str]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `resolve_partitions(rows, split, exact_conflicts: set[str]) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split, *, allow_test=False) -> np.ndarray[int]` (raises `TestSplitAccess` for `test` unless `allow_test=True`; only `v5/export.py` may pass it).
-- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/exact_dups.json`, `cache/exact_conflicts.json`, `cache/meta.json` (fingerprint), `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
+- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `PARTITIONS` (`test, train, val, calib, bench` in priority order), `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `class TestSplitAccess(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `cache_fingerprint(data_dir, data_cfg) -> str`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]` (keeps every decoded window, exact duplicates included; dedup is resolved after split assignment), `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `load_exact_conflicts(out_dir) -> list[str]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `resolve_partitions(rows, split) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split, *, allow_test=False) -> np.ndarray[int]` (raises `TestSplitAccess` for `test` unless `allow_test=True`; only `v5/export.py` may pass it).
+- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/meta.json` (fingerprint), `exact_dups.json`, `exact_conflicts.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
 - Split values (single `split` column): `train`, `val` (early stopping and model selection), `calib` (threshold calibration), `test` (Kaggle, read only by the exporter), `bench` (streaming benchmark and DoA sweep material plus MS-SNSD noise beds), `sanity`, `drop`.
 - Split rule (deterministic, from `cfg["data"]`): WHLTalent recordings whose batch id (`category`) is in `whl_val_batches` are split by recording, `whl_bench_frac` (ceil) → bench, rest → val; other WHLTalent batches → train. ESC-50 fold `esc50_val_fold` → val, fold `esc50_calib_fold` → calib, other folds → train. MS-SNSD files: `bench_frac` → bench, then `mssnsd_val_frac` → val, `mssnsd_calib_frac` → calib, rest → train (seeded). Kaggle → test; wild → sanity.
-- Isolation rule: every group and every near-duplicate cluster lives in at most one partition. When one spans several, it is assigned to the highest-priority partition in `PARTITIONS` order (`test` first, so the test set is never altered by other partitions) and the rows in the other partitions are dropped. Clusters with conflicting labels and exact-duplicate waveforms with conflicting labels are dropped everywhere.
+- Isolation rule, applied after split assignment in this order: (1) exact-duplicate waveforms (same MD5): conflicting labels → every copy dropped (`exact_conflict`); otherwise exactly one copy survives, in the highest-priority partition among the copies (`PARTITIONS` order, `test` first), the others are dropped (`exact_dup`); (2) near-duplicate clusters with conflicting labels → dropped everywhere (`conflict`); (3) a group or cluster spanning several partitions keeps only its highest-priority partition (`partition`). The test set therefore never loses a window to a training copy.
 - Fail-closed rule: the dataset root must contain `whltalent/s*`, `whltalent/e*`, `esc50/audio`, `esc50/meta/esc50.csv` and at least one MS-SNSD wav; every required source must yield at least one decoded window; a cached build is reused only when its fingerprint (data root, per-source file counts, data config) matches; minimum window counts per partition are enforced.
 - Leakage statement (goes into the report): WHLTalent carries no subject metadata, so the split is batch-disjoint (file-name prefix) for train vs val/bench and recording-disjoint between val and bench, not proven subject-disjoint; ESC-50 uses its official folds; the Kaggle test set is a separate collection never used for training, selection, calibration, benchmark material or teacher scoring.
 
@@ -1025,16 +1025,23 @@ def test_near_dup_clusters_joins_close_pairs():
     assert ids[0] == ids[1] and ids[0] != ids[2]
 
 
-def test_resolve_partitions_keeps_highest_priority_and_drops_conflicts():
+def test_resolve_partitions_priority_exact_dups_and_conflicts():
     rows = _rows(8, cluster=[0, 0, 1, 2, 3, 3, 4, 4], label=[1, 1, 0, 1, 1, 0, 0, 0], group=["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g6"])
     split = ["train", "val", "val", "test", "train", "calib", "val", "calib"]
-    out, dropped = M.resolve_partitions(rows, split, exact_conflicts={"2"})
-    # cluster 0: train beats val; cluster 3: conflicting labels -> both dropped; group g6 spans val and calib -> val wins; md5 "2" is an exact conflict
-    assert out == ["train", "drop", "drop", "test", "drop", "drop", "val", "drop"]
-    assert dropped == {("partition", "whl_s"): 2, ("conflict", "whl_s"): 2, ("exact_conflict", "whl_s"): 1}
-    rows2 = _rows(2, cluster=[0, 0], split=["val", "test"], label=[1, 1])
-    out2, _ = M.resolve_partitions(rows2, ["val", "test"], set())
-    assert out2 == ["drop", "test"]  # test isolation wins over val
+    out, dropped = M.resolve_partitions(rows, split)
+    # cluster 0: train beats val; cluster 3: conflicting labels -> both dropped; group g6 spans val and calib -> val wins
+    assert out == ["train", "drop", "val", "test", "drop", "drop", "val", "drop"]
+    assert dropped == {("partition", "whl_s"): 2, ("conflict", "whl_s"): 2}
+    # exact duplicates: same md5 in train and test -> the test copy survives; same md5 twice in train -> one survives
+    rows2 = _rows(5, cluster=[0, 1, 2, 3, 4], label=[1, 1, 0, 0, 1])
+    for i, h in enumerate(["a", "a", "b", "b", "c"]):
+        rows2[i]["md5"] = h
+    out2, dropped2 = M.resolve_partitions(rows2, ["train", "test", "train", "train", "val"])
+    assert out2 == ["drop", "test", "train", "drop", "val"] and dropped2 == {("exact_dup", "whl_s"): 2}
+    # exact duplicates with conflicting labels are dropped everywhere
+    rows3 = _rows(2, cluster=[0, 1], label=[1, 0])
+    rows3[0]["md5"] = rows3[1]["md5"] = "z"
+    assert M.resolve_partitions(rows3, ["train", "test"])[0] == ["drop", "drop"]
 
 
 def test_check_invariants_rejects_any_shared_partition():
@@ -1073,10 +1080,10 @@ def test_build_manifest_end_to_end(mini_dataset, tmp_path):
     rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), seed=42)
     out = tmp_path / "out"
     assert (out / "manifest.csv").exists() and (out / "manifest_report.md").exists() and (out / "cache" / "meta.json").exists()
-    md5s = [r["md5"] for r in rows]
-    assert len(md5s) == len(set(md5s))  # exact dedup: the jibran copy of adria_s_0000 is gone
+    kept = [r for r in rows if r["split"] != "drop"]
+    assert len({r["md5"] for r in kept}) == len(kept)  # exactly one copy of every waveform survives
     dups = M.load_exact_dups(out)
-    assert len(dups) == 1 and dups[0]["source"] == "kaggle_jibran"
+    assert len(dups) == 1 and dups[0]["source"] == "kaggle_jibran" and dups[0]["kept_source"] == "kaggle_adria"
     assert "kaggle_adria ~ kaggle_jibran" in (out / "manifest_report.md").read_text()
     assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
     assert all(r["split"] == "sanity" for r in rows if r["source"] == "wild")
@@ -1097,11 +1104,23 @@ def test_build_manifest_end_to_end(mini_dataset, tmp_path):
     assert len(tr) > 0 and all(rows[i]["split"] == "train" for i in tr)
 
 
+def test_exact_duplicate_keeps_the_test_copy_over_a_training_copy(mini_dataset, tmp_path):
+    clip = sf.read(mini_dataset / "adrianagaler" / "noise" / "adria_n_0000.wav", dtype="float32")[0]
+    tail = 0.05 * np.random.default_rng(11).standard_normal(19 * F.SR).astype(np.float32)
+    sf.write(mini_dataset / "RAW" / "MS-SNSD" / "noise_train" / "Typing_9.wav", np.concatenate([clip, tail]), F.SR, subtype="PCM_16")  # first second == the Kaggle clip
+    rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
+    twins = [r for r in rows if r["path"].endswith("adria_n_0000.wav") or (r["path"].endswith("Typing_9.wav") and r["offset"] == 0)]
+    assert len(twins) == 2 and len({r["md5"] for r in twins}) == 1
+    assert {r["split"] for r in twins if r["source"] == "kaggle_adria"} == {"test"}
+    assert {r["split"] for r in twins if r["source"] == "mssnsd"} == {"drop"}
+    assert any(d["source"] == "mssnsd" and d["kept_source"] == "kaggle_adria" for d in M.load_exact_dups(tmp_path / "out"))
+
+
 def test_exact_duplicate_with_conflicting_label_is_dropped(mini_dataset, tmp_path):
     src = sf.read(mini_dataset / "adrianagaler" / "snore" / "adria_s_0001.wav", dtype="float32")[0]
     sf.write(mini_dataset / "snoring_extra" / "jibran" / "jibran_n_0001.wav", src, F.SR, subtype="PCM_16")  # same waveform, labelled noise
     rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
-    assert not any(r["path"].endswith("adria_s_0001.wav") and r["split"] != "drop" for r in rows)
+    assert {r["split"] for r in rows if r["path"].endswith(("adria_s_0001.wav", "jibran_n_0001.wav"))} == {"drop"}
     assert M.load_exact_conflicts(tmp_path / "out")
     assert "exact_conflict" in (tmp_path / "out" / "manifest_report.md").read_text()
 
@@ -1221,20 +1240,13 @@ def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
     out_dir = Path(out_dir)
     (out_dir / "cache").mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    rows, audio, feats, errors, exact_dups = [], [], [], [], []
-    seen: dict[str, int] = {}
-    labels_by_md5: dict[str, set] = defaultdict(set)
+    rows, audio, feats, errors = [], [], [], []
     per_source = Counter()
-    for src in SOURCE_PRIORITY:
+    for src in SOURCE_PRIORITY:  # exact duplicates are kept here and resolved after split assignment
         try:
             for w, x in S.iter_windows(data_dir, src, rng, cfg.get("data", {}), errors):
                 xi = F.float_to_int16(x)
                 h = hashlib.md5(xi.tobytes()).hexdigest()
-                labels_by_md5[h].add(w.label)
-                if h in seen:
-                    exact_dups.append({"kept_id": seen[h], "kept_source": rows[seen[h]]["source"], "source": w.source, "path": w.path, "label": w.label})
-                    continue
-                seen[h] = len(rows)
                 per_source[src] += 1
                 rows.append({"id": len(rows), "source": w.source, "path": w.path, "offset": w.offset, "label": w.label,
                              "group": w.group, "category": w.category, "md5": h, "dup_cluster": -1, "split": ""})
@@ -1247,14 +1259,11 @@ def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
     empty = [src for src in REQUIRED_SOURCES if per_source[src] == 0]
     if empty:
         raise DatasetMissing(f"required sources yielded no decoded windows: {empty} (see manifest_errors.csv)")
-    exact_conflicts = sorted(h for h, labels in labels_by_md5.items() if len(labels) > 1)
     audio = np.stack(audio)
     feats = np.stack(feats).astype(np.float32)
     np.save(out_dir / "cache" / "audio_i16.npy", audio)
     np.save(out_dir / "cache" / "feats.npy", feats)
     (out_dir / "cache" / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
-    (out_dir / "cache" / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
-    (out_dir / "cache" / "exact_conflicts.json").write_text(json.dumps(exact_conflicts), encoding="utf-8")
     (out_dir / "cache" / "meta.json").write_text(json.dumps({"fingerprint": cache_fingerprint(data_dir, cfg.get("data", {})), "windows": len(rows), "per_source": dict(per_source)}), encoding="utf-8")
     with open(out_dir / "manifest_errors.csv", "w", newline="", encoding="utf-8") as fh:
         wr = csv.DictWriter(fh, fieldnames=["path", "error"])
@@ -1270,12 +1279,12 @@ def load_cache(out_dir):
 
 
 def load_exact_dups(out_dir) -> list[dict]:
-    p = Path(out_dir) / "cache" / "exact_dups.json"
+    p = Path(out_dir) / "exact_dups.json"
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
 def load_exact_conflicts(out_dir) -> list[str]:
-    p = Path(out_dir) / "cache" / "exact_conflicts.json"
+    p = Path(out_dir) / "exact_conflicts.json"
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
@@ -1353,18 +1362,38 @@ def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
     return split
 
 
-def resolve_partitions(rows, split, exact_conflicts: set[str]):
-    """Enforce isolation: conflicting content is dropped everywhere; a group or cluster spanning
-    several partitions keeps only its highest-priority partition (PARTITIONS order)."""
+def _priority(partitions) -> str:
+    return next(p for p in PARTITIONS if p in partitions)
+
+
+def resolve_partitions(rows, split):
+    """Enforce isolation after split assignment (spec 4.3-4.4):
+    1. exact duplicates (same md5): conflicting labels -> all copies dropped; otherwise one copy survives
+       in the highest-priority partition, the others are dropped;
+    2. near-duplicate clusters with conflicting labels are dropped everywhere;
+    3. a group or cluster spanning several partitions keeps only its highest-priority partition."""
     out, dropped = list(split), Counter()
-    conflict = conflicting_clusters(rows)
+    by_md5 = defaultdict(list)
     for i, r in enumerate(rows):
-        if out[i] == "sanity":
+        if out[i] in PARTITIONS:
+            by_md5[r["md5"]].append(i)
+    for idxs in by_md5.values():
+        if len(idxs) < 2:
             continue
-        if r["md5"] in exact_conflicts:
-            out[i] = "drop"
-            dropped[("exact_conflict", r["source"])] += 1
-        elif r["dup_cluster"] in conflict:
+        if len({rows[i]["label"] for i in idxs}) > 1:
+            for i in idxs:
+                out[i] = "drop"
+                dropped[("exact_conflict", rows[i]["source"])] += 1
+            continue
+        winner = _priority({out[i] for i in idxs})
+        keep = next(i for i in idxs if out[i] == winner)  # first in source-priority order within the winning partition
+        for i in idxs:
+            if i != keep:
+                out[i] = "drop"
+                dropped[("exact_dup", rows[i]["source"])] += 1
+    conflict = conflicting_clusters([r for r, s in zip(rows, out) if s in PARTITIONS])
+    for i, r in enumerate(rows):
+        if out[i] in PARTITIONS and r["dup_cluster"] in conflict:
             out[i] = "drop"
             dropped[("conflict", r["source"])] += 1
     for key in ("group", "dup_cluster"):
@@ -1372,7 +1401,7 @@ def resolve_partitions(rows, split, exact_conflicts: set[str]):
         for r, s in zip(rows, out):
             if s in PARTITIONS:
                 present[r[key]].add(s)
-        winner = {k: next(p for p in PARTITIONS if p in s) for k, s in present.items() if len(s) > 1}
+        winner = {k: _priority(s) for k, s in present.items() if len(s) > 1}
         for i, r in enumerate(rows):
             if out[i] in PARTITIONS and r[key] in winner and out[i] != winner[r[key]]:
                 out[i] = "drop"
@@ -1381,6 +1410,8 @@ def resolve_partitions(rows, split, exact_conflicts: set[str]):
 
 
 def check_invariants(rows) -> None:
+    kept = [r for r in rows if r["split"] in PARTITIONS]
+    assert len({r["md5"] for r in kept}) == len(kept), "exact duplicates survive in the partitions"
     for key in ("group", "dup_cluster"):
         present = defaultdict(set)
         for r in rows:
@@ -1427,7 +1458,8 @@ def _report(rows, exact_dups, exact_conflicts, dropped, members, path) -> None:
         for i in range(len(u)):
             for j in range(i + 1, len(u)):
                 near_pairs[(u[i], u[j])] += 1
-    lines = ["# Manifest report", "", f"windows kept: {len(rows)}; exact duplicates discarded: {len(exact_dups)}; exact-duplicate waveforms with conflicting labels: {len(exact_conflicts)}",
+    n_kept = sum(1 for r in rows if r["split"] in PARTITIONS)
+    lines = ["# Manifest report", "", f"windows decoded: {len(rows)}; kept in partitions: {n_kept}; exact duplicates dropped: {len(exact_dups)}; exact-duplicate waveforms with conflicting labels: {len(exact_conflicts)}",
              f"near-duplicate clusters with more than one member: {sum(1 for m in members.values() if len(m) > 1)}", "", LEAKAGE_STATEMENT, "",
              "exact duplicates across sources (kept ~ discarded):"]
     lines += [f"- {a} ~ {b}: {n}" for (a, b), n in sorted(exact_pairs.items())] or ["- none"]
@@ -1444,6 +1476,23 @@ def _report(rows, exact_dups, exact_conflicts, dropped, members, path) -> None:
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+def _exact_dup_provenance(rows) -> tuple[list[dict], list[str]]:
+    by_md5 = defaultdict(list)
+    for r in rows:
+        if r["split"] != "sanity":
+            by_md5[r["md5"]].append(r)
+    dups, conflicts = [], []
+    for h, group in by_md5.items():
+        if len(group) < 2:
+            continue
+        if len({r["label"] for r in group}) > 1:
+            conflicts.append(h)
+            continue
+        kept = next((r for r in group if r["split"] != "drop"), group[0])
+        dups += [{"kept_id": kept["id"], "kept_source": kept["source"], "id": r["id"], "source": r["source"], "path": r["path"], "label": r["label"]} for r in group if r is not kept]
+    return dups, sorted(conflicts)
+
+
 def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bool = False) -> list[dict]:
     out_dir = Path(out_dir)
     d = cfg.get("data", {})
@@ -1456,17 +1505,20 @@ def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bo
     clusters = near_dup_clusters(feats, float(d.get("near_dup_threshold", 0.98)))
     for r, c in zip(rows, clusters):
         r["dup_cluster"] = int(c)
-    exact_conflicts = set(load_exact_conflicts(out_dir))
-    split, dropped = resolve_partitions(rows, assign_splits(rows, d, seed), exact_conflicts)
+    split, dropped = resolve_partitions(rows, assign_splits(rows, d, seed))
     for r, s in zip(rows, split):
         r["split"] = s
     check_invariants(rows)
     check_min_counts(rows, d.get("min_counts", {}))
+    exact_dups, exact_conflicts = _exact_dup_provenance(rows)
+    (out_dir / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
+    (out_dir / "exact_conflicts.json").write_text(json.dumps(exact_conflicts), encoding="utf-8")
     members = defaultdict(list)
     for r in rows:
-        members[r["dup_cluster"]].append(r["source"])
+        if r["split"] in PARTITIONS:
+            members[r["dup_cluster"]].append(r["source"])
     write_manifest(rows, out_dir / "manifest.csv")
-    _report(rows, load_exact_dups(out_dir), sorted(exact_conflicts), dropped, members, out_dir / "manifest_report.md")
+    _report(rows, exact_dups, exact_conflicts, dropped, members, out_dir / "manifest_report.md")
     return rows
 
 
@@ -2413,7 +2465,8 @@ git commit -m "feat(v5): clip metrics, robustness sweep and int8 inference helpe
 - Consumes: `v5.data.manifest` (`read_manifest`, `load_cache`, `split_indices`), `v5.data.augment`, `v5.data.dataset`, `v5.model.build_model`, `v5.evaluate`, `v5.teacher` (`read_scores`, `platt_fit`, `platt_apply`).
 - Produces: `make_kd_loss(alpha: float) -> callable` and `kd_loss = make_kd_loss(0.5)`, `class ValAuc(keras.callbacks.Callback)`, `build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray`, `train_one(cfg, use_kd, width, epochs, name, seed=42) -> dict`, `class CalibrationError(RuntimeError)`, `fpr_upper_bound(fp, n, conf=0.95) -> float`, `choose_threshold(y_calib, p_calib, max_fpr=0.01, min_neg=300) -> tuple[float, dict]`, `select_config(results: list[dict]) -> dict`, `run_report(out_dir) -> str`, CLI `python -m v5.train {run,select,final,report}`.
 - Files: `output/v5/runs/<name>/{model.keras,metrics.json,history.json}`, `output/v5/selection.json`, `output/v5/threshold.json`, `output/v5/deployed/{model.keras,metrics.json}`, `output/v5/deliverables/experiments.md`.
-- `threshold.json` schema: `{"tau": float, "model_version": str, "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
+- `file_sha256(path) -> str`.
+- `threshold.json` schema: `{"tau": float, "model_version": str, "model_sha256": str (SHA-256 of the deployed model.keras), "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
 - Calibration contract: tau is the smallest float strictly above the largest negative score that may still pass, so at most `floor(max_fpr * n_neg)` calibration negatives score at or above tau. Fewer than `min_neg` negatives, a tau above 1.0, or zero positive recall raise `CalibrationError`; nothing is written in that case.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2457,6 +2510,12 @@ def test_choose_threshold_fails_closed():
         TR.choose_threshold(y, np.r_[np.full(300, 0.2), np.full(300, 0.9)], max_fpr=0.01)
     with pytest.raises(TR.CalibrationError):  # negatives saturate at 1.0
         TR.choose_threshold(y, np.r_[np.full(300, 1.0), np.full(300, 1.0)], max_fpr=0.01)
+
+
+def test_file_sha256(tmp_path):
+    p = tmp_path / "f.bin"
+    p.write_bytes(b"abc")
+    assert TR.file_sha256(p) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
 
 def test_fpr_upper_bound_is_conservative():
@@ -2513,6 +2572,7 @@ Expected: FAIL with `ImportError`
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -2636,6 +2696,14 @@ def train_one(cfg: dict, use_kd: bool, width: float, epochs: int, name: str, see
     return metrics
 
 
+def file_sha256(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def fpr_upper_bound(fp: int, n: int, conf: float = 0.95) -> float:
     """One-sided Clopper-Pearson upper bound on the false-positive rate."""
     from scipy.stats import beta
@@ -2730,7 +2798,8 @@ def main(argv=None) -> None:
         run_metrics = json.loads((run_dir / "metrics.json").read_text())
         run_metrics["calib"] = info
         (out / "deployed" / "metrics.json").write_text(json.dumps(run_metrics, indent=2))
-        (out / "threshold.json").write_text(json.dumps({"tau": tau, "model_version": cfg["model_version"], "max_fpr": cfg["threshold"]["max_fpr"], "run": sel["name"], "calib": info, "fsm": cfg["fsm"]}, indent=2))
+        sha = file_sha256(out / "deployed" / "model.keras")
+        (out / "threshold.json").write_text(json.dumps({"tau": tau, "model_version": cfg["model_version"], "model_sha256": sha, "max_fpr": cfg["threshold"]["max_fpr"], "run": sel["name"], "calib": info, "fsm": cfg["fsm"]}, indent=2))
         print(f"deployed {sel['name']} with tau={tau:.4f} calib_fpr={info['fpr']:.4f} (95% upper {info['fpr_upper95']:.4f}) calib_recall={info['recall']:.3f}")
     elif args.cmd == "report":
         (out / "deliverables").mkdir(parents=True, exist_ok=True)
@@ -3246,7 +3315,7 @@ git commit -m "feat(v5): synthetic night generator"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.nights`, `v5.streaming` (`EpisodeFsm`, `FsmParams`), `v5.evaluate` (`predict_probs`, `int8_probs`, `make_distance_rirs`), `v5.data.manifest`, `v5.data.sources.decode`.
-- Produces: `window_features(audio, hop=8000) -> np.ndarray (n,61,30,1)`, `tick_end_time(tick, tick_s=0.5) -> float` (= `(tick + 2) * tick_s`), `run_fsm(p_seq, params) -> tuple[list[dict], list[bool]]` (events carry `t_end`), `match_events(events, episodes, tol_s) -> tuple[list[tuple[int, dict]], list[dict]]`, `score_night(events, actives, episodes, tick_s=0.5, tol_s=5.0, duration_s=3600.0) -> dict` (keys `n_episodes, detected, detection_rate, confirm_latency_mean_s, confirm_latency_p90_s, false_confirms, false_confirms_per_hour, stop_latency_mean_s, stop_latency_p90_s, end_event_delay_mean_s`), `run_benchmark(predictors: dict[str, callable], params, cfg, seed=0) -> dict`, `to_markdown(result) -> str`, CLI `python -m v5.benchmark_nights [--model ..] [--tflite ..] [--threshold ..]`.
+- Produces: `window_features(audio, hop=8000) -> np.ndarray (n,61,30,1)`, `tick_end_time(tick, tick_s=0.5) -> float` (= `(tick + 2) * tick_s`), `run_fsm(p_seq, params) -> tuple[list[dict], list[bool]]` (events carry `t_end`), `match_events(events, episodes, tol_s) -> tuple[list[tuple[int, dict]], list[dict]]`, `score_night(events, actives, episodes, tick_s=0.5, tol_s=5.0, duration_s=3600.0) -> dict` (keys `n_episodes, detected, detection_rate, confirm_latency_mean_s, confirm_latency_p90_s, false_confirms, false_confirms_per_hour, stop_latency_mean_s, stop_latency_p90_s, end_event_delay_mean_s`), `bench_bed_paths(rows) -> list[str]` (MS-SNSD label-0 bench files only), `run_benchmark(predictors: dict[str, callable], params, cfg, seed=0) -> dict`, `to_markdown(result) -> str`, CLI `python -m v5.benchmark_nights [--model ..] [--tflite ..] [--threshold ..]`.
 - Matching rule: episode_start events are processed in time order; each is assigned to the earliest unmatched episode whose window `[s - tol_s, e + tol_s]` contains the event's `t_end`; unassigned events are false confirms; unassigned episodes are misses. Latency is `max(0, t_end - s)`. Stop latency uses the first tick at or after the matched start event where `active` is false, clamped at zero when that falls before the labelled end; the end-event delay uses the `episode_end` carrying the same `episode_id` (nan when absent).
 - Night material: snore and distractor windows come from the `bench` partition (WHLTalent validation-batch recordings reserved for benchmarking plus MS-SNSD bench windows); beds from `bench` MS-SNSD files. The benchmark never reads the `test` split (`split_indices` would raise). The int8 predictor is the product path; the float predictor is reported for reference together with the tick-level decision agreement between the two.
 - Files: `output/v5/benchmark_nights.json`, `output/v5/deliverables/benchmark_nights.md`.
@@ -3317,6 +3386,9 @@ def test_run_benchmark_with_fake_predictors(mini_dataset, tmp_path):
     cfg["benchmark"] = {"n_nights": 2, "night_s": 90, "snrs": [10]}
     rows = M.build_manifest(cfg["paths"]["data_dir"], cfg["paths"]["out_dir"], cfg)
     assert any(r["split"] == "bench" and r["label"] == 1 for r in rows)
+    beds = B.bench_bed_paths(rows)
+    assert beds and all("MS-SNSD" in p for p in beds)
+    assert all(r["source"] == "mssnsd" and r["label"] == 0 for r in rows if r["path"] in beds)
     zeros = lambda X: np.zeros(len(X))
     ones = lambda X: np.full(len(X), 0.9)
     result = B.run_benchmark({"float": zeros, "int8": ones}, FsmParams(), cfg, seed=0)
@@ -3420,9 +3492,13 @@ def score_night(events, actives, episodes, tick_s: float = 0.5, tol_s: float = 5
     }
 
 
+def bench_bed_paths(rows) -> list[str]:
+    """MS-SNSD negatives only: bench also holds WHLTalent snore recordings, which must never become a bed."""
+    return sorted({r["path"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd" and r["label"] == 0})
+
+
 def _bench_beds(rows, data_dir) -> list[np.ndarray]:
-    paths = sorted({r["path"] for r in rows if r["split"] == "bench"})
-    return [decode(Path(data_dir) / p) for p in paths]
+    return [decode(Path(data_dir) / p) for p in bench_bed_paths(rows)]
 
 
 def _aggregate(nights, snrs) -> dict:
@@ -4073,9 +4149,10 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
-- Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees.
-- Release gates (all must pass before anything is promoted): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `check_threshold_binding(model_path, thr: dict) -> str` (raises `ExportError` unless `thr["model_sha256"]` equals the SHA-256 of the model file), `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees. The successful `export_status.json` is written into the stage and travels inside the swap, so a live release always carries its own status; cleanup of backups and the stage after the swap is best-effort and never fails the export.
+- The exporter verifies `threshold.json`'s `model_sha256` against the model file before it reads the manifest or the test split.
+- Release gates (all must pass before anything is promoted; the threshold/model binding is checked first): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4144,11 +4221,25 @@ def test_gates_raise_export_error():
         X.validate_tflite(b"not a model")
 
 
+def test_threshold_must_be_bound_to_the_model(tmp_path):
+    from v5.train import file_sha256
+
+    a, b = build_model(0.5), build_model(0.5)
+    a.save(tmp_path / "a.keras")
+    b.save(tmp_path / "b.keras")
+    thr = {"tau": 0.6, "model_sha256": file_sha256(tmp_path / "a.keras")}
+    assert X.check_threshold_binding(tmp_path / "a.keras", thr) == thr["model_sha256"]
+    with pytest.raises(X.ExportError):
+        X.check_threshold_binding(tmp_path / "b.keras", thr)
+    with pytest.raises(X.ExportError):
+        X.check_threshold_binding(tmp_path / "a.keras", {"tau": 0.6})
+
+
 def _stage(tmp_path, tag):
     stage = tmp_path / f"stage_{tag}"
     (stage / "golden").mkdir(parents=True)
     for name in X.PROMOTED_FILES:
-        (stage / name).write_text(f"{name}:{tag}")
+        (stage / name).write_text(f"{name}:{tag}")  # includes export_status.json, which travels inside the swap
     (stage / "golden" / "features.bin").write_bytes(tag.encode())
     return stage
 
@@ -4182,6 +4273,21 @@ def test_promote_keeps_other_files_and_is_transactional(tmp_path, monkeypatch):
     monkeypatch.setattr(X.os, "rename", real_rename)
     assert _tree(deliv) == before_deliv and _tree(gen) == before_gen  # previous release fully restored
     assert not (tmp_path / "deliv.new").exists() and not (tmp_path / "gen.new").exists() and not (tmp_path / "deliv.bak").exists()
+
+
+def test_promote_survives_backup_cleanup_failure(tmp_path, monkeypatch):
+    deliv, gen = tmp_path / "deliv", tmp_path / "gen"
+    X.promote(_stage(tmp_path, "v1"), deliv, gen)
+    real_rmtree = X.shutil.rmtree
+
+    def flaky_rmtree(path, *args, **kwargs):
+        if str(path).endswith(".bak"):
+            raise OSError("injected cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(X.shutil, "rmtree", flaky_rmtree)
+    X.promote(_stage(tmp_path, "v2"), deliv, gen)  # must not raise: the release is live
+    assert (deliv / "snore_v5_int8.tflite").read_text() == "snore_v5_int8.tflite:v2" and (gen / "model_meta.h").read_text() == "model_meta.h:v2"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -4220,11 +4326,21 @@ HEADER_NOTE = "// Auto-generated by v5/export.py from the frozen feature spec; d
 ALLOWED_TFLITE_OPS = {"CONV_2D", "MAX_POOL_2D", "MEAN", "FULLY_CONNECTED", "LOGISTIC", "RESHAPE", "QUANTIZE", "DEQUANTIZE"}
 PARITY_LIMITS = {"delta_auc": 0.005, "agreement": 0.99, "max_abs_diff": 0.05}
 HEADER_FILES = ("feature_spec.h", "mel_filterbank.h", "model_meta.h", "model_data.h", "model_data.c")
-PROMOTED_FILES = ["snore_v5_int8.tflite", "robustness.json", "export_info.json", "test_metrics.json", *HEADER_FILES]
+PROMOTED_FILES = ["snore_v5_int8.tflite", "robustness.json", "export_info.json", "export_status.json", "test_metrics.json", *HEADER_FILES]
 
 
 class ExportError(RuntimeError):
     """A release gate failed; nothing was promoted."""
+
+
+def check_threshold_binding(model_path, thr: dict) -> str:
+    from v5.train import file_sha256
+
+    expected = thr.get("model_sha256")
+    actual = file_sha256(model_path)
+    if not expected or expected != actual:
+        raise ExportError(f"threshold.json is bound to model sha256 {expected}, but {model_path} has {actual}; re-run `python -m v5.train final`")
+    return actual
 
 
 def to_tflite_int8(model, rep_X) -> bytes:
@@ -4521,14 +4637,17 @@ def promote(stage, deliv, gen_dir) -> None:
             if new.exists():
                 shutil.rmtree(new)
         raise
-    for _, bak in swapped:
+    for _, bak in swapped:  # post-commit cleanup is best-effort: the new release is already live
         if bak is not None and bak.exists():
-            shutil.rmtree(bak)
+            try:
+                shutil.rmtree(bak)
+            except OSError as exc:
+                print(f"[export] warning: could not remove backup {bak}: {exc}")
 
 
-def _write_status(deliv: Path, status: str, **extra) -> None:
-    deliv.mkdir(parents=True, exist_ok=True)
-    (deliv / "export_status.json").write_text(json.dumps({"status": status, "at": datetime.now().isoformat(timespec="seconds"), **extra}, indent=1))
+def _write_status(target_dir: Path, status: str, **extra) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "export_status.json").write_text(json.dumps({"status": status, "at": datetime.now().isoformat(timespec="seconds"), **extra}, indent=1))
 
 
 def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
@@ -4550,7 +4669,9 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         tau, model_version = float(thr["tau"]), thr["model_version"]
         fsm = FsmParams.from_config(tau, thr["fsm"])
         doa = DoaParams(spacing_m=float(cfg["doa"]["spacing_m"]))
-        model = keras.models.load_model(model_path or out / "deployed" / "model.keras", compile=False)
+        model_file = Path(model_path or out / "deployed" / "model.keras")
+        model_sha = check_threshold_binding(model_file, thr)  # before any manifest or test-split access
+        model = keras.models.load_model(model_file, compile=False)
         check_ops(model)
         rows = M.read_manifest(out / "manifest.csv")
         _, audio, _ = M.load_cache(out)
@@ -4573,17 +4694,20 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         parity = int8_parity(p_fp, p_i8, y[te], tau)
         check_parity(parity)
         test_metrics = {"float": clip_metrics(y[te], p_fp, tau), "int8": clip_metrics(y[te], p_i8, tau)}
-        bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench"]]
+        bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd" and r["label"] == 0]]  # never snore material
         robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
-        info = {"model_version": model_version, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
+        info = {"model_version": model_version, "model_sha256": model_sha, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
                 "tflite_sha256": hashlib.sha256(tflite).hexdigest(), "params": int(model.count_params()), "qp": valid, "parity": parity, "parity_limits": PARITY_LIMITS,
                 "arena": arena_estimate(model, len(tflite)), "test": test_metrics, "n_test": int(len(te)), "exported_at": datetime.now().isoformat(timespec="seconds")}
         (stage / "export_info.json").write_text(json.dumps(info, indent=1))
         (stage / "test_metrics.json").write_text(json.dumps(test_metrics, indent=1))
         (stage / "robustness.json").write_text(json.dumps(robustness, indent=1))
+        _write_status(stage, "ok", model_version=model_version, model_sha256=model_sha, tflite_sha256=info["tflite_sha256"])  # travels inside the swap
         promote(stage, deliv, GEN_DIR)
-        shutil.rmtree(stage)
-        _write_status(deliv, "ok", model_version=model_version, tflite_sha256=info["tflite_sha256"])
+        try:
+            shutil.rmtree(stage)
+        except OSError as exc:  # the release is live; leftover stage files are harmless
+            print(f"[export] warning: could not remove {stage}: {exc}")
         return info
     except Exception as exc:
         _write_status(deliv, "failed", error=f"{type(exc).__name__}: {exc}", stage=str(stage))
@@ -5224,7 +5348,7 @@ git commit -m "feat(fw-v5): episode state machine in C with golden-trace test"
 
 **Interfaces:**
 - Produces C API: `void doa_gcc_phat(const float *l, const float *r, int max_lag, float band_lo, float band_hi, float *lag, float *ratio);` (512-sample frames, same sign convention as Python), `typedef struct {...} doa_tracker_t; void doa_tracker_init(doa_tracker_t *t, float spacing_m); int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *lag_out); void doa_tracker_episode(const doa_tracker_t *t, doa_episode_t *out);` with `doa_episode_t { int side; float lag_samples, lag_ms, conf; int n_valid; }` and side codes 0 unknown, 1 left, 2 right.
-- Parity contract: per frame, lag within 0.05 samples and the validity decision equal; per episode, side and `n_valid` exact, `lag_samples` within 0.05, `conf` within 1e-6.
+- Parity contract: per frame, lag within 0.05 samples and the validity decision equal; per episode, side and `n_valid` exact, `lag_samples` within 0.05, `lag_ms` within 0.05/16, `conf` within 1e-6.
 
 - [ ] **Step 1: Write the host test and extend the pytest wrapper**
 
@@ -5290,7 +5414,7 @@ static int run_tracker(const char *path) {
     fclose(fh);
     doa_episode_t ep;
     doa_tracker_episode(&t, &ep);
-    int ok = ep.side == side && ep.n_valid == n_valid && fabsf(ep.lag_samples - ep_ref[0]) <= 0.05f && fabsf(ep.conf - ep_ref[2]) <= 1e-6f;
+    int ok = ep.side == side && ep.n_valid == n_valid && fabsf(ep.lag_samples - ep_ref[0]) <= 0.05f && fabsf(ep.lag_ms - ep_ref[1]) <= 0.05f / 16.0f && fabsf(ep.conf - ep_ref[2]) <= 1e-6f;
     printf("tracker episode: side %d (ref %d) lag %.3f (ref %.3f) conf %.4f (ref %.4f) n_valid %d (ref %d) %s\n", ep.side, side, ep.lag_samples, ep_ref[0], ep.conf, ep_ref[2], ep.n_valid, n_valid, ok ? "ok" : "MISMATCH");
     return failures + (ok ? 0 : 1);
 }
