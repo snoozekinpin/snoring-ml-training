@@ -3746,7 +3746,7 @@ git commit -m "feat(v5): streaming benchmark with int8 path and one-to-one event
 
 **Interfaces:**
 - Consumes: `v5.features.hann_periodic`.
-- Produces: `@dataclass(frozen=True) DoaParams(spacing_m=0.06, fs=16000, c=343.0, band=(60.0,3000.0), n_fft=512, deadzone=0.2, min_ratio=1.5, floor_margin_db=6.0)` with property `max_lag: int`; `gcc_phat(l, r, max_lag, fs=16000, band=(60,3000), n_fft=512) -> tuple[float lag, float ratio]`; `frame_level_db(x) -> float`; `class NoiseFloor(init_db=-60.0, alpha=0.02)` with `update(level_db) -> float`; `side_from_lag(lag, max_lag, deadzone=0.2) -> str`; `LAG_BIN = 0.01` (samples), `class DoaTracker(params)` with `reset()`, `frame(l, r) -> tuple[float, bool]`, `episode() -> dict(side, lag_samples, lag_ms, conf, n_valid)`; the tracker keeps a lag histogram (bin 0.01 samples over ±max_lag) and per-frame side counts instead of a frame list, so episodes of any length use bounded memory; the episode lag is the lower-median bin centre and `conf` is the share of valid frames whose own side equals the median's side; `both_sides_rule(episodes, min_conf=0.7, min_share=0.25) -> bool`.
+- Produces: `@dataclass(frozen=True) DoaParams(spacing_m=0.06, fs=16000, c=343.0, band=(60.0,3000.0), n_fft=512, deadzone=0.2, min_ratio=1.5, floor_margin_db=6.0)` with property `max_lag: int`; `gcc_phat(l, r, max_lag, fs=16000, band=(60,3000), n_fft=512) -> tuple[float lag, float ratio]`; `frame_level_db(x) -> float`; `class NoiseFloor(init_db=-60.0, alpha=0.02, alpha_up=0.002)` with `update(level_db, coherent=False) -> float` (fast tracking when the frame is near or below the floor; slow upward adaptation only for loud incoherent frames; loud coherent frames never raise the floor); `side_from_lag(lag, max_lag, deadzone=0.2) -> str`; `LAG_BIN = 0.01` (samples), `class DoaTracker(params)` with `reset()`, `frame(l, r) -> tuple[float, bool]` (validity is judged against the floor before this frame's update, so a long coherent episode stays valid), `episode() -> dict(side, lag_samples, lag_ms, conf, n_valid)`; the tracker keeps a lag histogram (bin 0.01 samples over ±max_lag) and per-frame side counts instead of a frame list, so episodes of any length use bounded memory; the episode lag is the lower-median bin centre and `conf` is the share of valid frames whose own side equals the median's side; `both_sides_rule(episodes, min_conf=0.7, min_share=0.25) -> bool`.
 - Sign convention: `r[n] = l[n - d]` (signal reaches L first) gives lag `+d`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3813,11 +3813,14 @@ def test_tracker_episode_side_and_confidence():
     assert t.episode()["side"] == "right"
 
 
-def test_noise_floor_adapts_up_slowly_and_down_fast():
+def test_noise_floor_adapts_up_slowly_and_down_fast_but_not_for_coherent_frames():
     nf = D.NoiseFloor()
     for _ in range(2000):
+        nf.update(-40.0, coherent=True)
+    assert nf.db == -60.0  # a loud coherent source never raises the floor
+    for _ in range(2000):
         nf.update(-40.0)
-    assert nf.db > -41.0  # converged up to the steady level
+    assert nf.db > -41.0  # loud incoherent background converges up to the steady level
     for _ in range(200):
         nf.update(-70.0)
     assert nf.db < -68.0  # fast decay back down
@@ -3915,15 +3918,18 @@ def frame_level_db(x) -> float:
 
 
 class NoiseFloor:
-    """Tracks the ambient level: fast when the input is near or below the floor, slow upward
-    otherwise, so a steady loud background (a fan) eventually stops counting as signal."""
+    """Tracks the ambient level: fast when the input is near or below the floor, slow upward for
+    loud incoherent frames (a fan eventually stops counting as signal), and never raised by loud
+    coherent frames (a snoring source must not erode its own validity)."""
 
     def __init__(self, init_db: float = -60.0, alpha: float = 0.02, alpha_up: float = 0.002):
         self.db, self.alpha, self.alpha_up = init_db, alpha, alpha_up
 
-    def update(self, level_db: float) -> float:
-        rate = self.alpha if level_db < self.db + 5.0 else self.alpha_up
-        self.db += rate * (level_db - self.db)
+    def update(self, level_db: float, coherent: bool = False) -> float:
+        if level_db < self.db + 5.0:
+            self.db += self.alpha * (level_db - self.db)
+        elif not coherent:
+            self.db += self.alpha_up * (level_db - self.db)
         return self.db
 
 
@@ -3958,9 +3964,10 @@ class DoaTracker:
 
     def frame(self, l, r):
         level = frame_level_db(l)
-        floor = self.floor.update(level)
         lag, ratio = gcc_phat(l, r, self.p.max_lag, self.p.fs, self.p.band, self.p.n_fft)
-        valid = bool(level >= floor + self.p.floor_margin_db and ratio >= self.p.min_ratio)
+        coherent = ratio >= self.p.min_ratio
+        valid = bool(level >= self.floor.db + self.p.floor_margin_db and coherent)  # judged against the floor before this frame
+        self.floor.update(level, coherent)
         if valid:
             self.hist[self._bin(lag)] += 1
             self.n_valid += 1
@@ -4304,14 +4311,14 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Files:**
 - Create: `v5/export.py`, `tests/test_export.py`
-- Generated (tracked): `esp32_firmware/v5/generated/{feature_spec.h,mel_filterbank.h,model_meta.h,model_data.h,model_data.c}`, `output/v5/deliverables/{snore_v5_int8.tflite,export_info.json,export_status.json,test_metrics.json,robustness.json,model_card.md,golden/features.npz,golden/features.bin,golden/fsm_trace.txt,golden/doa_cases.bin,golden/doa_tracker.bin}`
+- Generated (tracked): `esp32_firmware/v5/generated/{feature_spec.h,mel_filterbank.h,model_meta.h,model_data.h,model_data.c}`, `output/v5/deliverables/{snore_v5_int8.tflite,export_info.json,export_status.json,test_metrics.json,robustness.json,model_card.md,golden/features.npz,golden/features.bin,golden/fsm_trace.txt,golden/doa_cases.bin,golden/doa_tracker.bin}`; untracked: `output/v5/test_consumption.json`, `output/v5/test_evaluation/<model_sha>/`
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `claim_test_split(out_dir, manifest_sha, model_sha) -> dict | None` (records `output/v5/test_consumption.json`; returns the persisted results when the same model re-exports; raises `ExportError` when a different model asks for the same manifest's test split), `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `claim_test_split(out_dir, manifest_sha, model_sha) -> dict | None` (records `output/v5/test_consumption.json`; returns the completed evaluation bundle when the same model re-exports; raises `ExportError` for a different model on the same manifest or for an incomplete, locked record), `persist_test_results(out_dir, bundle: dict, tflite: bytes, golden_files: dict[str, bytes]) -> Path` (writes `output/v5/test_evaluation/<model_sha>/` atomically and completes the record), `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
 - Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees. The successful `export_status.json` is written into the stage and travels inside the swap, so a live release always carries its own status; cleanup of backups and the stage after the swap is best-effort and never fails the export.
 - The exporter verifies the model version and `threshold.json`'s `model_sha256` before it reads the manifest or the test split.
-- One-time test evaluation is enforced by `output/v5/test_consumption.json` (outside the promoted trees): it stores the manifest SHA-256, the model SHA-256 and the persisted float/int8 test results. A re-export of the same model reuses the persisted results instead of re-running inference; a different model against the same manifest is refused with instructions to record the reason and delete the file deliberately. A rebuilt manifest (new SHA) starts a new record. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
+- One-time test evaluation is enforced by `output/v5/test_consumption.json` (outside the promoted trees) plus an immutable evaluation bundle `output/v5/test_evaluation/<model_sha>/` holding the exact evaluated TFLite bytes, the test-derived golden feature files, parity, metrics and robustness. The first export of a model reads the test split once and writes the bundle atomically; a re-export of the same model on the same manifest reuses the bundle (its TFLite bytes become the artifact) without calling `split_indices(..., "test")` or touching test audio; a different model on the same manifest, or an incomplete record left by an interrupted attempt, is refused with instructions to document the reason and delete the record deliberately. A rebuilt manifest (new SHA) starts a new record. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
 - Release gates (all must pass before anything is promoted; the threshold/model binding is checked first): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, the attempt is recorded in `export_stage/export_status.json` and `output/v5/export_last_attempt.json`, and the promoted release including its own `export_status.json` is left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
@@ -4413,9 +4420,13 @@ def _tree(d):
 
 
 def test_test_split_is_consumed_once_per_manifest(tmp_path):
-    assert X.claim_test_split(tmp_path, "m1", "modelA") is None
-    X.persist_test_results(tmp_path, {"tflite_sha256": "t", "parity": {"passed": True}, "test_metrics": {}, "robustness": {}})
-    assert X.claim_test_split(tmp_path, "m1", "modelA")["parity"]["passed"] is True  # same model: persisted results
+    assert X.claim_test_split(tmp_path, "m1", "modelA") is None  # fresh claim
+    with pytest.raises(X.ExportError):
+        X.claim_test_split(tmp_path, "m1", "modelA")  # interrupted attempt: record exists but no bundle -> locked
+    bundle = X.persist_test_results(tmp_path, {"tflite_sha256": "t", "parity": {"passed": True}, "test_metrics": {}, "robustness": {}, "n_test": 8}, b"tflite-bytes", {"features.bin": b"g"})
+    assert (bundle / "snore_v5_int8.tflite").read_bytes() == b"tflite-bytes" and (bundle / "golden" / "features.bin").read_bytes() == b"g"
+    again = X.claim_test_split(tmp_path, "m1", "modelA")  # same model: the completed bundle, no test access needed
+    assert again["parity"]["passed"] is True and again["bundle_dir"] == str(bundle)
     with pytest.raises(X.ExportError):
         X.claim_test_split(tmp_path, "m1", "modelB")  # another model on the same manifest
     assert X.claim_test_split(tmp_path, "m2", "modelB") is None  # a rebuilt manifest starts a new record
@@ -4516,26 +4527,59 @@ def check_threshold_binding(model_path, thr: dict) -> str:
     return actual
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def claim_test_split(out_dir, manifest_sha: str, model_sha: str):
-    """Enforce the one-time test evaluation. Returns persisted results for a repeat export of the same model."""
-    record = Path(out_dir) / "test_consumption.json"
+    """Enforce the one-time test evaluation.
+
+    Returns None when this model may evaluate the test split now (a fresh record is written), or the
+    completed evaluation bundle when the same model re-exports. Raises for another model on the same
+    manifest and for an incomplete record left by an interrupted attempt."""
+    out_dir = Path(out_dir)
+    record = out_dir / "test_consumption.json"
+    reset_hint = (f"If that is a deliberate decision, record the reason in the model card and delete {record} "
+                  f"and {out_dir / 'test_evaluation'} by hand.")
     if record.exists():
         prev = json.loads(record.read_text(encoding="utf-8"))
         if prev["manifest_sha256"] == manifest_sha:
             if prev["model_sha256"] != model_sha:
                 raise ExportError(f"the test split of this manifest was already consumed by model {prev['model_sha256'][:12]} on {prev['at']}; "
-                                  "evaluating another model would turn the test set into a development set. If that is a deliberate decision, "
-                                  f"record the reason in the model card and delete {record} by hand.")
-            return prev.get("results")
-    record.write_text(json.dumps({"manifest_sha256": manifest_sha, "model_sha256": model_sha, "at": datetime.now().isoformat(timespec="seconds"), "results": None}, indent=1), encoding="utf-8")
+                                  "evaluating another model would turn the test set into a development set. " + reset_hint)
+            bundle_dir = out_dir / "test_evaluation" / model_sha
+            if not prev.get("complete") or not (bundle_dir / "results.json").exists():
+                raise ExportError(f"a previous evaluation of model {model_sha[:12]} was interrupted before its bundle was completed; "
+                                  "the record is locked. " + reset_hint)
+            results = json.loads((bundle_dir / "results.json").read_text(encoding="utf-8"))
+            results["bundle_dir"] = str(bundle_dir)
+            return results
+    _write_json_atomic(record, {"manifest_sha256": manifest_sha, "model_sha256": model_sha, "at": datetime.now().isoformat(timespec="seconds"), "complete": False})
     return None
 
 
-def persist_test_results(out_dir, results: dict) -> None:
-    record = Path(out_dir) / "test_consumption.json"
+def persist_test_results(out_dir, results: dict, tflite: bytes, golden_files: dict) -> Path:
+    """Write the immutable evaluation bundle (staged, then renamed) and complete the record."""
+    out_dir = Path(out_dir)
+    record = out_dir / "test_consumption.json"
     prev = json.loads(record.read_text(encoding="utf-8"))
-    prev["results"] = results
-    record.write_text(json.dumps(prev, indent=1), encoding="utf-8")
+    final = out_dir / "test_evaluation" / prev["model_sha256"]
+    tmp = final.with_name(final.name + ".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    (tmp / "golden").mkdir(parents=True)
+    (tmp / "snore_v5_int8.tflite").write_bytes(tflite)
+    for name, data in golden_files.items():
+        (tmp / "golden" / name).write_bytes(data)
+    (tmp / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    if final.exists():
+        shutil.rmtree(final)
+    os.rename(tmp, final)
+    prev["complete"] = True
+    _write_json_atomic(record, prev)
+    return final
 
 
 def precheck_release(model_path, thr: dict) -> str:
@@ -4882,36 +4926,44 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
 
         rows = M.read_manifest(out / "manifest.csv")
         manifest_sha = file_sha256(out / "manifest.csv")
-        persisted = claim_test_split(out, manifest_sha, model_sha)  # refuses a second model; returns results for a repeat export
+        persisted = claim_test_split(out, manifest_sha, model_sha)  # None: evaluate once now; dict: reuse the immutable bundle
         _, audio, _ = M.load_cache(out)
         y = np.array([r["label"] for r in rows])
-        tr, te = M.split_indices(rows, "train"), M.split_indices(rows, "test", allow_test=True)  # the single sanctioned read of the test split
-        rng = np.random.default_rng(cfg["seed"])
-        tflite = to_tflite_int8(model, precompute_features(audio[rng.choice(tr, size=min(500, len(tr)), replace=False)]))
-        valid = validate_tflite(tflite)
-        (stage / "snore_v5_int8.tflite").write_bytes(tflite)
         write_headers_only(stage, golden, fsm, doa)
-        write_c_array(tflite, "snore_v5_int8_tflite", stage / "model_data.h", stage / "model_data.c")
-        write_model_meta_h(stage / "model_meta.h", valid, tau, fsm, model_version)
-        snore = [audio[i] for i in te if y[i] == 1][:4]
-        noise = [audio[i] for i in te if y[i] == 0][:4]
-        names, gx, gX, gq = G.make_golden(snore, noise, scale=valid["input_scale"], zero_point=valid["input_zero_point"])
-        G.write_golden_npz(golden / "features.npz", names, gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
-        G.write_golden_bin(golden / "features.bin", gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
-        if persisted is not None and persisted.get("tflite_sha256") == hashlib.sha256(tflite).hexdigest():
-            parity, test_metrics, robustness = persisted["parity"], persisted["test_metrics"], persisted["robustness"]
-        else:
+        if persisted is None:
+            tr = M.split_indices(rows, "train")
+            te = M.split_indices(rows, "test", allow_test=True)  # the single sanctioned read of the test split
+            rng = np.random.default_rng(cfg["seed"])
+            tflite = to_tflite_int8(model, precompute_features(audio[rng.choice(tr, size=min(500, len(tr)), replace=False)]))
+            valid = validate_tflite(tflite)
+            snore = [audio[i] for i in te if y[i] == 1][:4]
+            noise = [audio[i] for i in te if y[i] == 0][:4]
+            names, gx, gX, gq = G.make_golden(snore, noise, scale=valid["input_scale"], zero_point=valid["input_zero_point"])
+            G.write_golden_npz(golden / "features.npz", names, gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
+            G.write_golden_bin(golden / "features.bin", gx, gX, gq, valid["input_scale"], valid["input_zero_point"])
             Xt = precompute_features(audio[te])
             p_fp, p_i8 = predict_probs(model, Xt), int8_probs(tflite, Xt)
             parity = int8_parity(p_fp, p_i8, y[te], tau)
             test_metrics = {"float": clip_metrics(y[te], p_fp, tau), "int8": clip_metrics(y[te], p_i8, tau)}
             bench_noise = audio[[r["id"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd" and r["label"] == 0]]  # never snore material
             robustness = robustness_sweep(model, audio[te], y[te], bench_noise, tau, seed=cfg["seed"])
-            persist_test_results(out, {"tflite_sha256": hashlib.sha256(tflite).hexdigest(), "parity": parity, "test_metrics": test_metrics, "robustness": robustness})
+            results = {"tflite_sha256": hashlib.sha256(tflite).hexdigest(), "qp": valid, "parity": parity, "test_metrics": test_metrics, "robustness": robustness, "n_test": int(len(te))}
+            persist_test_results(out, results, tflite, {"features.npz": (golden / "features.npz").read_bytes(), "features.bin": (golden / "features.bin").read_bytes()})
+        else:  # repeat export of the same model: the bundle is the artifact, no test access at all
+            bundle = Path(persisted["bundle_dir"])
+            tflite = (bundle / "snore_v5_int8.tflite").read_bytes()
+            valid = validate_tflite(tflite)
+            for name in ("features.npz", "features.bin"):
+                shutil.copy(bundle / "golden" / name, golden / name)
+            parity, test_metrics, robustness, results = persisted["parity"], persisted["test_metrics"], persisted["robustness"], persisted
+        (stage / "snore_v5_int8.tflite").write_bytes(tflite)
+        write_c_array(tflite, "snore_v5_int8_tflite", stage / "model_data.h", stage / "model_data.c")
+        write_model_meta_h(stage / "model_meta.h", valid, tau, fsm, model_version)
         check_parity(parity)
         info = {"model_version": model_version, "model_sha256": model_sha, "manifest_sha256": manifest_sha, "tau": tau, "run": thr.get("run"), "calib": thr.get("calib"), "tflite_bytes": len(tflite),
                 "tflite_sha256": hashlib.sha256(tflite).hexdigest(), "params": int(model.count_params()), "qp": valid, "parity": parity, "parity_limits": PARITY_LIMITS,
-                "arena": arena_estimate(model, len(tflite)), "test": test_metrics, "n_test": int(len(te)), "exported_at": datetime.now().isoformat(timespec="seconds")}
+                "arena": arena_estimate(model, len(tflite)), "test": test_metrics, "n_test": int(results["n_test"]), "test_evaluated_from_bundle": persisted is not None,
+                "exported_at": datetime.now().isoformat(timespec="seconds")}
         (stage / "export_info.json").write_text(json.dumps(info, indent=1))
         (stage / "test_metrics.json").write_text(json.dumps(test_metrics, indent=1))
         (stage / "robustness.json").write_text(json.dumps(robustness, indent=1))
@@ -5805,11 +5857,12 @@ int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *l
     double sq = 0.0;
     for (int n = 0; n < N; n++) sq += (double)l[n] * (double)l[n];
     float level = 20.0f * log10f(sqrtf((float)(sq / N)) + 1e-9f);
-    float rate = (level < t->floor_db + 5.0f) ? 0.02f : 0.002f; /* same rule as v5/doa.py NoiseFloor */
-    t->floor_db += rate * (level - t->floor_db);
     float lag, ratio;
     doa_gcc_phat(l, r, t->max_lag, t->band_lo, t->band_hi, &lag, &ratio);
-    int valid = level >= t->floor_db + t->floor_margin_db && ratio >= t->min_ratio;
+    int coherent = ratio >= t->min_ratio;
+    int valid = level >= t->floor_db + t->floor_margin_db && coherent; /* judged against the floor before this frame */
+    if (level < t->floor_db + 5.0f) t->floor_db += 0.02f * (level - t->floor_db);          /* same rule as v5/doa.py NoiseFloor */
+    else if (!coherent) t->floor_db += 0.002f * (level - t->floor_db);                    /* loud coherent frames never raise it */
     if (valid) {
         t->hist[lag_bin(t, lag)]++;
         t->side_counts[side_of(lag, t->max_lag, t->deadzone)]++;

@@ -247,9 +247,12 @@ model (SNR 20/10/5/0 dB with bench MS-SNSD negative windows only; RIR at 0.5/1.0
 
 Int8 parity gate (test split): ΔAUC < 0.005, decision agreement at τ ≥ 99 %, max |Δp| ≤ 0.05.
 Failure blocks the release. The one-time rule is enforced: `output/v5/test_consumption.json`
-records which model (SHA-256) consumed the test split of which manifest (SHA-256) together with
-the results; a repeat export of the same model reuses those results, and a different model is
-refused unless the record is deliberately deleted and the reason documented in the model card.
+records which model (SHA-256) consumed the test split of which manifest (SHA-256), and the first
+evaluation writes an immutable bundle (`output/v5/test_evaluation/<model_sha>/`: the exact
+evaluated TFLite bytes, the test-derived golden features, parity, metrics, robustness). A repeat
+export of the same model reuses the bundle without any test access; a different model, or an
+interrupted attempt that left the record incomplete, is refused unless the record and bundle are
+deliberately deleted and the reason documented in the model card.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
 bench-partition snore and distractor windows over beds made only from bench MS-SNSD negative files
@@ -304,8 +307,11 @@ Intervention start/stop, cooldown, budget and temperature stay in the firmware s
 (config, default 0.06 m, channel order L,R), c = 343 m/s, max lag = ceil(d/c · 16000) + 1 samples.
 
 - Per frame: GCC-PHAT with bins outside 60–3000 Hz zeroed; lag search within ± max lag with
-  parabolic sub-sample interpolation; valid if frame RMS is ≥ 6 dB above the running noise floor
-  and the PHAT peak is ≥ 1.5 × the second-highest peak outside ± 1 sample.
+  parabolic sub-sample interpolation; valid if frame RMS is ≥ 6 dB above the noise floor as it
+  stood before this frame and the PHAT peak is ≥ 1.5 × the second-highest peak outside ± 1 sample.
+  The floor tracks quickly when the frame is near or below it, adapts slowly upward for loud
+  incoherent frames (so a fan eventually stops counting as signal) and is never raised by loud
+  coherent frames (so a long snoring episode keeps its own validity).
 - Per episode: valid frame lags go into a histogram (0.01-sample bins over ± max lag) with
   per-frame side counters, so episodes of any length use bounded memory; lag = lower-median bin
   centre; side = left if lag > +0.2 · max lag, right if < −0.2 · max lag, else unknown;
