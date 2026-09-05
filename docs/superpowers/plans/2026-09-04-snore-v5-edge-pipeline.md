@@ -3928,7 +3928,7 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0)`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
 - Release gates (all must pass before anything is promoted): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
@@ -4229,19 +4229,29 @@ def _burst(rng, sos):
     return sosfilt(sos, rng.standard_normal(576))[64:] * 0.1
 
 
-def doa_golden_cases(seed: int = 0):
+def _uncorrelated_pair(rng, sos, params: DoaParams):
+    """An uncorrelated frame pair whose PHAT peak ratio is at least 0.05 away from min_ratio, so that
+    float32 (C) and float64 (Python) cannot disagree on validity at the boundary."""
+    while True:
+        l, r = F.float_to_int16(_burst(rng, sos)), F.float_to_int16(_burst(rng, sos))
+        _, ratio = gcc_phat(F.int16_to_float(l), F.int16_to_float(r), params.max_lag, params.fs, params.band, params.n_fft)
+        if abs(ratio - params.min_ratio) >= 0.05:
+            return l, r
+
+
+def doa_golden_cases(seed: int = 0, params: DoaParams = DoaParams()):
     rng = np.random.default_rng(seed)
     sos = butter(4, [100, 2000], btype="band", fs=F.SR, output="sos")
     cases = []
     for d in (-3.0, -2.0, -1.5, -1.0, 0.0, 1.0, 1.5, 2.0, 3.0):
         l = _burst(rng, sos)
         cases.append((F.float_to_int16(l), F.float_to_int16(_delayed(l, d))))
-    cases.append((F.float_to_int16(_burst(rng, sos)), F.float_to_int16(_burst(rng, sos))))  # uncorrelated pair
+    cases.append(_uncorrelated_pair(rng, sos, params))
     return cases
 
 
 def write_golden_doa_cases(path, params: DoaParams, seed: int = 0) -> None:
-    cases = doa_golden_cases(seed)
+    cases = doa_golden_cases(seed, params)
     with open(path, "wb") as fh:
         fh.write(np.array([len(cases), params.n_fft, params.max_lag], dtype="<i4").tobytes())
         for l, r in cases:
@@ -4251,7 +4261,7 @@ def write_golden_doa_cases(path, params: DoaParams, seed: int = 0) -> None:
             fh.write(np.array([lag, min(ratio, 1e6)], dtype="<f4").tobytes())
 
 
-def doa_tracker_frames(seed: int = 0):
+def doa_tracker_frames(seed: int = 0, params: DoaParams = DoaParams()):
     rng = np.random.default_rng(seed)
     sos = butter(4, [100, 2000], btype="band", fs=F.SR, output="sos")
     frames = []
@@ -4261,13 +4271,13 @@ def doa_tracker_frames(seed: int = 0):
     for _ in range(5):  # quiet frames, below the noise floor margin
         q = 1e-5 * rng.standard_normal(512)
         frames.append((F.float_to_int16(q), F.float_to_int16(q)))
-    for _ in range(10):  # uncorrelated pairs
-        frames.append((F.float_to_int16(_burst(rng, sos)), F.float_to_int16(_burst(rng, sos))))
+    for _ in range(10):  # uncorrelated pairs, kept away from the ratio boundary
+        frames.append(_uncorrelated_pair(rng, sos, params))
     return frames
 
 
 def write_golden_doa_tracker(path, params: DoaParams, seed: int = 0) -> None:
-    frames = doa_tracker_frames(seed)
+    frames = doa_tracker_frames(seed, params)
     tracker = DoaTracker(params)
     with open(path, "wb") as fh:
         fh.write(np.array([len(frames), params.n_fft], dtype="<i4").tobytes())
