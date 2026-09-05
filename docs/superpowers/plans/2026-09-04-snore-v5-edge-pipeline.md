@@ -20,7 +20,7 @@
 - DoA sign convention: positive lag means the signal reaches the L channel first (source on the left).
 - Commit after every task with a conventional message (`feat:`, `test:`, `docs:`), no co-author trailers.
 - Datasets are large; unit tests must never read `dataset/`; tests that do are marked `@pytest.mark.dataset` and skip when the directory is absent.
-- The split is immutable: `train` / `val` (early stopping, selection) / `calib` (threshold) / `test` (the whole Kaggle set) / `bench` (MS-SNSD beds). Nothing may train on, select on, calibrate on, or build synthetic nights from `test`; the exporter evaluates it exactly once.
+- The split is immutable and isolated: `train` / `val` (early stopping, selection) / `calib` (threshold) / `test` (the whole Kaggle set) / `bench` (benchmark and DoA material, MS-SNSD beds). Every group and near-duplicate cluster lives in one partition only. The test split is read by `v5/export.py` alone (`split_indices(..., allow_test=True)`), exactly once.
 - Fail closed: a missing dataset root, required source or minimum window count aborts the manifest build (`DatasetMissing`); calibration that cannot meet the FPR target aborts deployment (`CalibrationError`); export gates (int8 dtypes/shapes, operator set, parity limits) abort promotion (`ExportError`) and leave previous deliverables untouched.
 - C parity is a numerical contract, not "bit-exact": features within 5e-3 (quantised within 1 LSB, at most 1 % of cells off by one), FSM exact, DoA lag within 0.05 samples with identical validity and side.
 
@@ -35,7 +35,7 @@
 | `v5/data/sources.py` | decode, resample, peak-window slicing, per-source window iterators |
 | `v5/data/manifest.py` | cache build, exact + near dedup, immutable split, invariants, minimum counts, report |
 | `v5/data/augment.py` | RIR bank, noise mixing, tilt, shift, gain, SpecAugment, `Augmenter` |
-| `v5/data/dataset.py` | Keras `PyDataset` with 1:2 balanced batches, val feature precompute |
+| `v5/data/dataset.py` | Keras `PyDataset` with 1:2 balanced batches, reproducible per-sample RNG, val feature precompute |
 | `v5/model.py` | student CNN builder |
 | `v5/teacher.py` | optional YAMNet scoring, Platt calibration, label audit |
 | `v5/evaluate.py` | clip metrics, recall@FPR, robustness sweep, int8 inference and parity |
@@ -116,6 +116,7 @@ data:
   whl_val_batches: ["000002", "100002"]   # WHLTalent batch ids (file-name prefix) held out for validation
   esc50_val_fold: 4
   esc50_calib_fold: 5
+  whl_bench_frac: 0.5      # share of the validation-batch recordings reserved for the streaming/DoA benchmarks
   bench_frac: 0.2
   mssnsd_val_frac: 0.15
   mssnsd_calib_frac: 0.15
@@ -134,6 +135,8 @@ data:
     calib_neg: 300
     test_pos: 100
     test_neg: 100
+    bench_pos: 100
+    bench_neg: 100
 augment:
   rir_bank_size: 300
   p_rir: 0.6
@@ -249,6 +252,7 @@ def mini_dataset(tmp_path):
     for i in range(3):
         w(d / "whltalent" / "s1.1" / f"000000-A-0-00{i + 1}.wav", _buzz(rng, 10, f0=100 + 10 * i))
     w(d / "whltalent" / "s3" / "000002-A-2-001.wav", _buzz(rng, 10, f0=140))
+    w(d / "whltalent" / "s3" / "000002-A-2-002.wav", _buzz(rng, 10, f0=150))
     for sub_dir, batch in (("e1", "100000"), ("e2.1", "100001"), ("e3.1", "100002")):
         w(d / "whltalent" / sub_dir / f"{batch}-B-0-001.wav", _noise(rng, 10))
     # ESC-50 at 44.1 kHz with meta (folds 1 train, 4 val, 5 calib)
@@ -710,7 +714,7 @@ def test_silence_detection():
 
 
 @pytest.mark.parametrize("source,n_expected,label", [
-    ("whl_s", 12, 1), ("whl_e", 6, 0), ("mssnsd", 20, 0), ("kaggle_adria", 3, None), ("kaggle_jibran", 2, None), ("wild", 1, 1),
+    ("whl_s", 15, 1), ("whl_e", 6, 0), ("mssnsd", 20, 0), ("kaggle_adria", 3, None), ("kaggle_jibran", 2, None), ("wild", 1, 1),
 ])
 def test_iter_windows_counts(mini_dataset, source, n_expected, label):
     rng = np.random.default_rng(0)
@@ -733,7 +737,7 @@ def test_esc50_labels_and_groups(mini_dataset):
 def test_whl_groups_are_per_recording_and_category_is_batch(mini_dataset):
     items = list(S.iter_windows(mini_dataset, "whl_s", np.random.default_rng(0)))
     groups = {w.group for w, _ in items}
-    assert len(groups) == 4 and all(g.startswith("whl_00000") for g in groups)
+    assert len(groups) == 5 and all(g.startswith("whl_00000") for g in groups)
     assert {w.category for w, _ in items} == {"000000", "000002"}
 
 
@@ -742,7 +746,7 @@ def test_errors_are_collected_not_raised(mini_dataset):
     bad.write_bytes(b"not a wav")
     errors = []
     items = list(S.iter_windows(mini_dataset, "whl_s", np.random.default_rng(0), errors=errors))
-    assert len(items) == 12 and len(errors) == 1 and "broken.wav" in errors[0]["path"]
+    assert len(items) == 15 and len(errors) == 1 and "broken.wav" in errors[0]["path"]
 
 
 def test_load_window_matches_iterated_audio(mini_dataset):
@@ -958,36 +962,41 @@ git commit -m "feat(v5): source decoding and one-second window slicing"
 ```
 
 ---
-### Task 5: Manifest with content dedup and an immutable split
+### Task 5: Manifest with content dedup and an immutable, isolated split
 
 **Files:**
 - Create: `v5/data/manifest.py`, `tests/test_manifest.py`
 
 **Interfaces:**
 - Consumes: `v5.data.sources` (`iter_windows`, `SOURCE_IDS`, `TEST_SOURCES`), `v5.features` (`float_to_int16`, `extract_int16`).
-- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]`, `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `enforce_cluster_rule(rows, split) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split) -> np.ndarray[int]`.
-- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/exact_dups.json`, `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
-- Split values (single `split` column): `train`, `val` (early stopping and model selection), `calib` (threshold calibration), `test` (Kaggle, used exactly once by the exporter), `bench` (MS-SNSD files reserved as benchmark noise beds), `sanity`, `drop`.
-- Split rule (deterministic, from `cfg["data"]`): WHLTalent windows whose batch id (`category`) is in `whl_val_batches` → val, others → train; ESC-50 fold `esc50_val_fold` → val, fold `esc50_calib_fold` → calib, other folds → train; MS-SNSD files: `bench_frac` → bench, then `mssnsd_val_frac` → val, `mssnsd_calib_frac` → calib, rest → train (seeded); Kaggle → test; wild → sanity. Eval windows sharing a near-duplicate cluster with a train window are dropped; clusters with conflicting labels are dropped everywhere.
-- Leakage statement (goes into the report): WHLTalent carries no subject metadata, so the split is batch-disjoint (the file-name prefix), not proven subject-disjoint; ESC-50 uses its official folds; the Kaggle test set is a separate collection never used for training, selection or calibration.
+- Produces: `COLUMNS`, `SPLITS`, `EVAL_SPLITS`, `PARTITIONS` (`test, train, val, calib, bench` in priority order), `REQUIRED_SOURCES`, `class DatasetMissing(RuntimeError)`, `class TestSplitAccess(RuntimeError)`, `check_dataset_root(data_dir) -> None`, `cache_fingerprint(data_dir, data_cfg) -> str`, `build_cache(data_dir, out_dir, cfg, seed=42) -> tuple[list[dict], np.ndarray int16 (N,16000), np.ndarray float32 (N,1830)]`, `load_cache(out_dir) -> same tuple`, `load_exact_dups(out_dir) -> list[dict]`, `load_exact_conflicts(out_dir) -> list[str]`, `near_dup_clusters(feats, thr=0.98, block=1024) -> np.ndarray[int]`, `conflicting_clusters(rows) -> set[int]`, `assign_splits(rows, data_cfg: dict, seed=42) -> list[str]`, `resolve_partitions(rows, split, exact_conflicts: set[str]) -> tuple[list[str], dict]`, `check_invariants(rows) -> None`, `check_min_counts(rows, min_counts: dict) -> None`, `build_manifest(data_dir, out_dir, cfg, seed=42, reuse_cache=False) -> list[dict]`, `write_manifest(rows, path)`, `read_manifest(path) -> list[dict]`, `split_indices(rows, split, *, allow_test=False) -> np.ndarray[int]` (raises `TestSplitAccess` for `test` unless `allow_test=True`; only `v5/export.py` may pass it).
+- Files written under `out_dir`: `cache/audio_i16.npy`, `cache/feats.npy`, `cache/rows.json`, `cache/exact_dups.json`, `cache/exact_conflicts.json`, `cache/meta.json` (fingerprint), `manifest.csv`, `manifest_report.md`, `manifest_errors.csv`.
+- Split values (single `split` column): `train`, `val` (early stopping and model selection), `calib` (threshold calibration), `test` (Kaggle, read only by the exporter), `bench` (streaming benchmark and DoA sweep material plus MS-SNSD noise beds), `sanity`, `drop`.
+- Split rule (deterministic, from `cfg["data"]`): WHLTalent recordings whose batch id (`category`) is in `whl_val_batches` are split by recording, `whl_bench_frac` (ceil) → bench, rest → val; other WHLTalent batches → train. ESC-50 fold `esc50_val_fold` → val, fold `esc50_calib_fold` → calib, other folds → train. MS-SNSD files: `bench_frac` → bench, then `mssnsd_val_frac` → val, `mssnsd_calib_frac` → calib, rest → train (seeded). Kaggle → test; wild → sanity.
+- Isolation rule: every group and every near-duplicate cluster lives in at most one partition. When one spans several, it is assigned to the highest-priority partition in `PARTITIONS` order (`test` first, so the test set is never altered by other partitions) and the rows in the other partitions are dropped. Clusters with conflicting labels and exact-duplicate waveforms with conflicting labels are dropped everywhere.
+- Fail-closed rule: the dataset root must contain `whltalent/s*`, `whltalent/e*`, `esc50/audio`, `esc50/meta/esc50.csv` and at least one MS-SNSD wav; every required source must yield at least one decoded window; a cached build is reused only when its fingerprint (data root, per-source file counts, data config) matches; minimum window counts per partition are enforced.
+- Leakage statement (goes into the report): WHLTalent carries no subject metadata, so the split is batch-disjoint (file-name prefix) for train vs val/bench and recording-disjoint between val and bench, not proven subject-disjoint; ESC-50 uses its official folds; the Kaggle test set is a separate collection never used for training, selection, calibration, benchmark material or teacher scoring.
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_manifest.py`:
 ```python
+import shutil
+
 import numpy as np
 import pytest
+import soundfile as sf
 
 from v5 import features as F
-from v5.config import load_config
+from v5.config import ROOT, load_config
 from v5.data import manifest as M
 
-TINY_MIN = {"train_pos": 1, "train_neg": 1, "val_pos": 0, "val_neg": 0, "calib_neg": 0, "test_pos": 1, "test_neg": 1}
+TINY_MIN = {"train_pos": 1, "train_neg": 1, "val_pos": 0, "val_neg": 0, "calib_neg": 0, "test_pos": 1, "test_neg": 1, "bench_pos": 0, "bench_neg": 0}
 
 
-def _rows(n, source="whl_s", cluster=None, split=None, label=None):
-    return [{"id": i, "source": source, "path": f"p{i}", "offset": 0, "label": (label[i] if label else i % 2), "group": f"g{i}", "category": "c", "md5": str(i),
-             "dup_cluster": (cluster[i] if cluster else i), "split": (split[i] if split else "train")} for i in range(n)]
+def _rows(n, source="whl_s", cluster=None, split=None, label=None, group=None):
+    return [{"id": i, "source": source, "path": f"p{i}", "offset": 0, "label": (label[i] if label else i % 2), "group": (group[i] if group else f"g{i}"), "category": "c",
+             "md5": str(i), "dup_cluster": (cluster[i] if cluster else i), "split": (split[i] if split else "train")} for i in range(n)]
 
 
 def _cfg(threshold=0.999):
@@ -997,12 +1006,14 @@ def _cfg(threshold=0.999):
     return cfg
 
 
-def test_check_dataset_root_raises_when_missing(tmp_path):
+def test_check_dataset_root_requires_every_source(tmp_path, mini_dataset):
     with pytest.raises(M.DatasetMissing):
         M.check_dataset_root(tmp_path / "nowhere")
-    (tmp_path / "whltalent").mkdir()
-    with pytest.raises(M.DatasetMissing):  # esc50 and MS-SNSD missing
-        M.check_dataset_root(tmp_path)
+    M.check_dataset_root(mini_dataset)
+    shutil.rmtree(mini_dataset / "whltalent" / "s1.1")
+    shutil.rmtree(mini_dataset / "whltalent" / "s3")
+    with pytest.raises(M.DatasetMissing, match="whltalent/s"):
+        M.check_dataset_root(mini_dataset)
 
 
 def test_near_dup_clusters_joins_close_pairs():
@@ -1014,24 +1025,28 @@ def test_near_dup_clusters_joins_close_pairs():
     assert ids[0] == ids[1] and ids[0] != ids[2]
 
 
-def test_enforce_cluster_rule_drops_leaks_and_conflicts():
-    rows = _rows(6, cluster=[0, 0, 1, 2, 3, 3], label=[1, 1, 0, 1, 1, 0])
-    split = ["train", "val", "val", "test", "train", "calib"]
-    out, dropped = M.enforce_cluster_rule(rows, split)
-    assert out == ["train", "drop", "val", "test", "drop", "drop"]
-    assert dropped == {("leak", "whl_s"): 1, ("conflict", "whl_s"): 2}
+def test_resolve_partitions_keeps_highest_priority_and_drops_conflicts():
+    rows = _rows(8, cluster=[0, 0, 1, 2, 3, 3, 4, 4], label=[1, 1, 0, 1, 1, 0, 0, 0], group=["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g6"])
+    split = ["train", "val", "val", "test", "train", "calib", "val", "calib"]
+    out, dropped = M.resolve_partitions(rows, split, exact_conflicts={"2"})
+    # cluster 0: train beats val; cluster 3: conflicting labels -> both dropped; group g6 spans val and calib -> val wins; md5 "2" is an exact conflict
+    assert out == ["train", "drop", "drop", "test", "drop", "drop", "val", "drop"]
+    assert dropped == {("partition", "whl_s"): 2, ("conflict", "whl_s"): 2, ("exact_conflict", "whl_s"): 1}
+    rows2 = _rows(2, cluster=[0, 0], split=["val", "test"], label=[1, 1])
+    out2, _ = M.resolve_partitions(rows2, ["val", "test"], set())
+    assert out2 == ["drop", "test"]  # test isolation wins over val
 
 
-def test_check_invariants_rejects_train_eval_overlap():
-    for eval_split in ("val", "calib", "test", "bench"):
-        rows = _rows(2)
+def test_check_invariants_rejects_any_shared_partition():
+    for a, b in (("train", "val"), ("val", "calib"), ("calib", "test"), ("train", "bench"), ("bench", "test")):
+        rows = _rows(2, split=[a, b])
         rows[1]["group"] = rows[0]["group"]
-        rows[0]["split"], rows[1]["split"] = "train", eval_split
         with pytest.raises(AssertionError):
             M.check_invariants(rows)
-    rows = _rows(2, split=["val", "calib"])
-    rows[1]["group"] = rows[0]["group"]
-    M.check_invariants(rows)  # eval partitions may share groups
+        rows = _rows(2, split=[a, b], cluster=[7, 7])
+        with pytest.raises(AssertionError):
+            M.check_invariants(rows)
+    M.check_invariants(_rows(2, split=["val", "sanity"], cluster=[7, 7]))  # sanity is outside the partitions
 
 
 def test_check_min_counts():
@@ -1041,10 +1056,23 @@ def test_check_min_counts():
         M.check_min_counts(rows, {**TINY_MIN, "train_pos": 2})
 
 
+def test_split_indices_guards_the_test_split():
+    rows = _rows(2, split=["train", "test"])
+    assert list(M.split_indices(rows, "train")) == [0]
+    with pytest.raises(M.TestSplitAccess):
+        M.split_indices(rows, "test")
+    assert list(M.split_indices(rows, "test", allow_test=True)) == [1]
+
+
+def test_only_the_exporter_reads_the_test_split():
+    users = sorted(p.name for p in (ROOT / "v5").rglob("*.py") if "allow_test=True" in p.read_text(encoding="utf-8"))
+    assert users == ["export.py"]
+
+
 def test_build_manifest_end_to_end(mini_dataset, tmp_path):
     rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), seed=42)
     out = tmp_path / "out"
-    assert (out / "manifest.csv").exists() and (out / "manifest_report.md").exists()
+    assert (out / "manifest.csv").exists() and (out / "manifest_report.md").exists() and (out / "cache" / "meta.json").exists()
     md5s = [r["md5"] for r in rows]
     assert len(md5s) == len(set(md5s))  # exact dedup: the jibran copy of adria_s_0000 is gone
     dups = M.load_exact_dups(out)
@@ -1052,37 +1080,58 @@ def test_build_manifest_end_to_end(mini_dataset, tmp_path):
     assert "kaggle_adria ~ kaggle_jibran" in (out / "manifest_report.md").read_text()
     assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
     assert all(r["split"] == "sanity" for r in rows if r["source"] == "wild")
-    whl = {r["category"]: r["split"] for r in rows if r["source"] in ("whl_s", "whl_e")}
-    assert whl["000000"] == "train" and whl["000002"] == "val" and whl["100002"] == "val"
+    by_batch = {}
+    for r in rows:
+        if r["source"] in ("whl_s", "whl_e"):
+            by_batch.setdefault(r["category"], set()).add(r["split"])
+    assert by_batch["000000"] == {"train"} and by_batch["000002"] == {"val", "bench"} and by_batch["100002"] <= {"val", "bench"}
     esc = {r["group"]: r["split"] for r in rows if r["source"] == "esc50"}
     assert esc["esc50_fold5"] == "calib" and esc["esc50_fold4"] == "val" and esc["esc50_fold1"] == "train"
-    bench = [r for r in rows if r["split"] == "bench"]
-    assert bench and all(r["source"] == "mssnsd" for r in bench) and len({r["group"] for r in bench}) == 1
+    bench_files = {r["group"] for r in rows if r["split"] == "bench" and r["source"] == "mssnsd"}
+    assert len(bench_files) == 1
     M.check_invariants(rows)
-    rows2 = M.read_manifest(out / "manifest.csv")
-    assert rows2 == rows
+    assert M.read_manifest(out / "manifest.csv") == rows
     audio, feats = M.load_cache(out)[1:]
     assert audio.shape == (len(rows), F.WIN) and feats.shape == (len(rows), F.FEATURE_DIM)
     tr = M.split_indices(rows, "train")
     assert len(tr) > 0 and all(rows[i]["split"] == "train" for i in tr)
 
 
-def test_build_manifest_reuses_cache_and_fails_on_min_counts(mini_dataset, tmp_path):
+def test_exact_duplicate_with_conflicting_label_is_dropped(mini_dataset, tmp_path):
+    src = sf.read(mini_dataset / "adrianagaler" / "snore" / "adria_s_0001.wav", dtype="float32")[0]
+    sf.write(mini_dataset / "snoring_extra" / "jibran" / "jibran_n_0001.wav", src, F.SR, subtype="PCM_16")  # same waveform, labelled noise
     rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
-    rows2 = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), reuse_cache=True)
-    assert rows == rows2
+    assert not any(r["path"].endswith("adria_s_0001.wav") and r["split"] != "drop" for r in rows)
+    assert M.load_exact_conflicts(tmp_path / "out")
+    assert "exact_conflict" in (tmp_path / "out" / "manifest_report.md").read_text()
+
+
+def test_cache_reuse_validates_fingerprint(mini_dataset, tmp_path):
+    rows = M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
+    assert M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), reuse_cache=True) == rows
+    shutil.rmtree(mini_dataset / "whltalent" / "s3")
+    (mini_dataset / "whltalent" / "s9").mkdir()
+    sf.write(mini_dataset / "whltalent" / "s9" / "000009-A-0-001.wav", 0.05 * np.random.default_rng(5).standard_normal(10 * F.SR).astype(np.float32), F.SR, subtype="PCM_16")
+    rows2 = M.build_manifest(mini_dataset, tmp_path / "out", _cfg(), reuse_cache=True)  # fingerprint changed -> rebuilt
+    assert any(r["category"] == "000009" for r in rows2) and not any(r["category"] == "000002" for r in rows2)
+
+
+def test_required_source_failures(mini_dataset, tmp_path):
+    for f in (mini_dataset / "esc50" / "audio").glob("*.wav"):
+        f.write_bytes(b"corrupt")
+    with pytest.raises(M.DatasetMissing, match="esc50"):
+        M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
+    for f in (mini_dataset / "RAW" / "MS-SNSD" / "noise_train").glob("*.wav"):
+        f.unlink()
+    with pytest.raises(M.DatasetMissing, match="MS-SNSD"):
+        M.check_dataset_root(mini_dataset)
+
+
+def test_build_manifest_fails_on_min_counts(mini_dataset, tmp_path):
     cfg = _cfg()
     cfg["data"]["min_counts"]["train_pos"] = 10_000
     with pytest.raises(M.DatasetMissing):
-        M.build_manifest(mini_dataset, tmp_path / "out", cfg, reuse_cache=True)
-
-
-def test_build_manifest_fails_when_required_source_missing(mini_dataset, tmp_path):
-    import shutil
-
-    shutil.rmtree(mini_dataset / "esc50")
-    with pytest.raises(M.DatasetMissing):
-        M.build_manifest(mini_dataset, tmp_path / "out", _cfg())
+        M.build_manifest(mini_dataset, tmp_path / "out", cfg)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1093,7 +1142,7 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/data/manifest.py`**
 
 ```python
-"""Manifest: decode every window once, dedup by content, immutable split (spec 4.3-4.4)."""
+"""Manifest: decode every window once, dedup by content, immutable isolated split (spec 4.3-4.4)."""
 from __future__ import annotations
 
 import argparse
@@ -1114,11 +1163,13 @@ COLUMNS = ["id", "source", "path", "offset", "label", "group", "category", "md5"
 INT_COLS = {"id", "offset", "label", "dup_cluster"}
 SOURCE_PRIORITY = ["whl_s", "whl_e", "esc50", "mssnsd", "kaggle_adria", "kaggle_jibran", "wild"]
 REQUIRED_SOURCES = ("whl_s", "whl_e", "esc50", "mssnsd")
+PARTITIONS = ("test", "train", "val", "calib", "bench")  # priority order for isolation conflicts
 EVAL_SPLITS = ("val", "calib", "test", "bench")
 SPLITS = ("train",) + EVAL_SPLITS + ("sanity", "drop")
 LEAKAGE_STATEMENT = (
-    "WHLTalent carries no subject metadata: the split is batch-disjoint (file-name prefix), not proven subject-disjoint. "
-    "ESC-50 uses its official folds (same-source clips share a fold). The Kaggle set is a separate collection used only as the final test."
+    "WHLTalent carries no subject metadata: train vs val/bench is batch-disjoint (file-name prefix) and val vs bench is recording-disjoint, "
+    "not proven subject-disjoint. ESC-50 uses its official folds (same-source clips share a fold). The Kaggle set is a separate collection "
+    "used only as the final test and read only by the exporter."
 )
 
 
@@ -1126,15 +1177,43 @@ class DatasetMissing(RuntimeError):
     """The dataset root, a required source, or a minimum window count is missing (spec section 13)."""
 
 
+class TestSplitAccess(RuntimeError):
+    """The test split may only be read by v5/export.py."""
+
+
+def _required_paths(data_dir: Path) -> dict:
+    return {
+        "whltalent/s* (whl_s)": sorted(p for p in (data_dir / "whltalent").glob("s*") if p.is_dir()),
+        "whltalent/e* (whl_e)": sorted(p for p in (data_dir / "whltalent").glob("e*") if p.is_dir()),
+        "esc50/audio": [data_dir / "esc50" / "audio"] if (data_dir / "esc50" / "audio").is_dir() else [],
+        "esc50/meta/esc50.csv": [data_dir / "esc50" / "meta" / "esc50.csv"] if (data_dir / "esc50" / "meta" / "esc50.csv").exists() else [],
+        "RAW/MS-SNSD/noise_train/*.wav": sorted((data_dir / "RAW" / "MS-SNSD" / "noise_train").glob("*.wav")),
+    }
+
+
 def check_dataset_root(data_dir) -> None:
     data_dir = Path(data_dir)
-    required = {"whltalent": data_dir / "whltalent", "esc50": data_dir / "esc50" / "audio", "esc50 meta": data_dir / "esc50" / "meta" / "esc50.csv",
-                "MS-SNSD": data_dir / "RAW" / "MS-SNSD" / "noise_train"}
-    missing = [f"{k} ({p})" for k, p in required.items() if not p.exists()]
     if not data_dir.exists():
         raise DatasetMissing(f"dataset root {data_dir} does not exist")
+    missing = [k for k, v in _required_paths(data_dir).items() if not v]
     if missing:
         raise DatasetMissing(f"dataset root {data_dir} is incomplete; missing: {', '.join(missing)}")
+
+
+def cache_fingerprint(data_dir, data_cfg: dict) -> str:
+    data_dir = Path(data_dir).resolve()
+    counts = {
+        "whl_s": sum(len(list(p.glob("*.wav"))) for p in (data_dir / "whltalent").glob("s*") if p.is_dir()),
+        "whl_e": sum(len(list(p.glob("*.wav"))) for p in (data_dir / "whltalent").glob("e*") if p.is_dir()),
+        "esc50": len(list((data_dir / "esc50" / "audio").glob("*.wav"))),
+        "mssnsd": len(list((data_dir / "RAW" / "MS-SNSD" / "noise_train").glob("*.wav"))),
+        "kaggle_adria": len(list((data_dir / "adrianagaler").rglob("*.wav"))),
+        "kaggle_jibran": len(list((data_dir / "snoring_extra" / "jibran").glob("*.wav"))),
+        "whl_dirs": sorted(p.name for p in (data_dir / "whltalent").iterdir() if p.is_dir()),
+    }
+    slicing = {k: v for k, v in data_cfg.items() if k.endswith("_windows") or k.endswith("_stride_s")}
+    payload = json.dumps({"data_dir": str(data_dir), "counts": counts, "slicing": slicing, "feature_spec": F.FEATURE_SPEC_VERSION}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
@@ -1142,16 +1221,21 @@ def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
     out_dir = Path(out_dir)
     (out_dir / "cache").mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    rows, audio, feats, seen, errors, exact_dups = [], [], [], {}, [], []
+    rows, audio, feats, errors, exact_dups = [], [], [], [], []
+    seen: dict[str, int] = {}
+    labels_by_md5: dict[str, set] = defaultdict(set)
+    per_source = Counter()
     for src in SOURCE_PRIORITY:
         try:
             for w, x in S.iter_windows(data_dir, src, rng, cfg.get("data", {}), errors):
                 xi = F.float_to_int16(x)
                 h = hashlib.md5(xi.tobytes()).hexdigest()
+                labels_by_md5[h].add(w.label)
                 if h in seen:
                     exact_dups.append({"kept_id": seen[h], "kept_source": rows[seen[h]]["source"], "source": w.source, "path": w.path, "label": w.label})
                     continue
                 seen[h] = len(rows)
+                per_source[src] += 1
                 rows.append({"id": len(rows), "source": w.source, "path": w.path, "offset": w.offset, "label": w.label,
                              "group": w.group, "category": w.category, "md5": h, "dup_cluster": -1, "split": ""})
                 audio.append(xi)
@@ -1160,14 +1244,18 @@ def build_cache(data_dir, out_dir, cfg: dict, seed: int = 42):
             if src in REQUIRED_SOURCES:
                 raise DatasetMissing(f"required source {src} unreadable: {exc}") from exc
             errors.append({"path": src, "error": f"optional source missing: {exc}"})
-    if not rows:
-        raise DatasetMissing("no windows were decoded")
+    empty = [src for src in REQUIRED_SOURCES if per_source[src] == 0]
+    if empty:
+        raise DatasetMissing(f"required sources yielded no decoded windows: {empty} (see manifest_errors.csv)")
+    exact_conflicts = sorted(h for h, labels in labels_by_md5.items() if len(labels) > 1)
     audio = np.stack(audio)
     feats = np.stack(feats).astype(np.float32)
     np.save(out_dir / "cache" / "audio_i16.npy", audio)
     np.save(out_dir / "cache" / "feats.npy", feats)
     (out_dir / "cache" / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
     (out_dir / "cache" / "exact_dups.json").write_text(json.dumps(exact_dups), encoding="utf-8")
+    (out_dir / "cache" / "exact_conflicts.json").write_text(json.dumps(exact_conflicts), encoding="utf-8")
+    (out_dir / "cache" / "meta.json").write_text(json.dumps({"fingerprint": cache_fingerprint(data_dir, cfg.get("data", {})), "windows": len(rows), "per_source": dict(per_source)}), encoding="utf-8")
     with open(out_dir / "manifest_errors.csv", "w", newline="", encoding="utf-8") as fh:
         wr = csv.DictWriter(fh, fieldnames=["path", "error"])
         wr.writeheader()
@@ -1183,6 +1271,11 @@ def load_cache(out_dir):
 
 def load_exact_dups(out_dir) -> list[dict]:
     p = Path(out_dir) / "cache" / "exact_dups.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+
+
+def load_exact_conflicts(out_dir) -> list[str]:
+    p = Path(out_dir) / "cache" / "exact_conflicts.json"
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
@@ -1222,6 +1315,7 @@ def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
     rng = np.random.default_rng(seed)
     whl_val = {str(b) for b in d.get("whl_val_batches", ["000002", "100002"])}
     esc_val, esc_calib = int(d.get("esc50_val_fold", 4)), int(d.get("esc50_calib_fold", 5))
+    # MS-SNSD files: bench, then val, calib, train
     ms_groups = sorted({r["group"] for r in rows if r["source"] == "mssnsd"})
     perm = [ms_groups[i] for i in rng.permutation(len(ms_groups))]
     n_bench = int(round(float(d.get("bench_frac", 0.2)) * len(perm)))
@@ -1232,6 +1326,14 @@ def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
     ms_split.update({g: "val" for g in rest[:n_val]})
     ms_split.update({g: "calib" for g in rest[n_val: n_val + n_calib]})
     ms_split.update({g: "train" for g in rest[n_val + n_calib:]})
+    # WHLTalent validation batches: recordings split between bench and val
+    whl_split = {}
+    for batch in sorted(whl_val):
+        recs = sorted({r["group"] for r in rows if r["source"] in ("whl_s", "whl_e") and r["category"] == batch})
+        order = [recs[i] for i in rng.permutation(len(recs))]
+        n_b = int(math.ceil(float(d.get("whl_bench_frac", 0.5)) * len(order))) if order else 0
+        whl_split.update({g: "bench" for g in order[:n_b]})
+        whl_split.update({g: "val" for g in order[n_b:]})
     split = []
     for r in rows:
         src = r["source"]
@@ -1240,7 +1342,7 @@ def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
         elif src in S.TEST_SOURCES:
             split.append("test")
         elif src in ("whl_s", "whl_e"):
-            split.append("val" if r["category"] in whl_val else "train")
+            split.append(whl_split.get(r["group"], "train") if r["category"] in whl_val else "train")
         elif src == "esc50":
             fold = int(r["group"].rsplit("fold", 1)[1])
             split.append("val" if fold == esc_val else "calib" if fold == esc_calib else "train")
@@ -1251,47 +1353,56 @@ def assign_splits(rows, d: dict, seed: int = 42) -> list[str]:
     return split
 
 
-def enforce_cluster_rule(rows, split):
-    conflict = conflicting_clusters(rows)
-    train_clusters = {r["dup_cluster"] for r, s in zip(rows, split) if s == "train" and r["dup_cluster"] not in conflict}
+def resolve_partitions(rows, split, exact_conflicts: set[str]):
+    """Enforce isolation: conflicting content is dropped everywhere; a group or cluster spanning
+    several partitions keeps only its highest-priority partition (PARTITIONS order)."""
     out, dropped = list(split), Counter()
-    for i, (r, s) in enumerate(zip(rows, split)):
-        if s == "sanity":
+    conflict = conflicting_clusters(rows)
+    for i, r in enumerate(rows):
+        if out[i] == "sanity":
             continue
-        if r["dup_cluster"] in conflict:
+        if r["md5"] in exact_conflicts:
+            out[i] = "drop"
+            dropped[("exact_conflict", r["source"])] += 1
+        elif r["dup_cluster"] in conflict:
             out[i] = "drop"
             dropped[("conflict", r["source"])] += 1
-        elif s in EVAL_SPLITS and r["dup_cluster"] in train_clusters:
-            out[i] = "drop"
-            dropped[("leak", r["source"])] += 1
+    for key in ("group", "dup_cluster"):
+        present = defaultdict(set)
+        for r, s in zip(rows, out):
+            if s in PARTITIONS:
+                present[r[key]].add(s)
+        winner = {k: next(p for p in PARTITIONS if p in s) for k, s in present.items() if len(s) > 1}
+        for i, r in enumerate(rows):
+            if out[i] in PARTITIONS and r[key] in winner and out[i] != winner[r[key]]:
+                out[i] = "drop"
+                dropped[("partition", r["source"])] += 1
     return out, dict(dropped)
 
 
 def check_invariants(rows) -> None:
-    by_group, by_cluster = defaultdict(set), defaultdict(set)
-    for r in rows:
-        if r["split"] == "train" or r["split"] in EVAL_SPLITS:
-            by_group[r["group"]].add(r["split"])
-            by_cluster[r["dup_cluster"]].add(r["split"])
-    evals = set(EVAL_SPLITS)
-    bad_g = [g for g, s in by_group.items() if "train" in s and (s & evals)]
-    bad_c = [c for c, s in by_cluster.items() if "train" in s and (s & evals)]
-    assert not bad_g, f"groups shared by train and an evaluation split: {bad_g[:5]}"
-    assert not bad_c, f"near-duplicate clusters shared by train and an evaluation split: {bad_c[:5]}"
+    for key in ("group", "dup_cluster"):
+        present = defaultdict(set)
+        for r in rows:
+            if r["split"] in PARTITIONS:
+                present[r[key]].add(r["split"])
+        bad = [k for k, s in present.items() if len(s) > 1]
+        assert not bad, f"{key}s present in more than one partition: {bad[:5]}"
     conflict = conflicting_clusters([r for r in rows if r["split"] != "drop"])
     assert not conflict, f"clusters with conflicting labels survive: {sorted(conflict)[:5]}"
 
 
 def check_min_counts(rows, min_counts: dict) -> None:
     cnt = Counter((r["split"], r["label"]) for r in rows)
-    actual = {"train_pos": cnt[("train", 1)], "train_neg": cnt[("train", 0)], "val_pos": cnt[("val", 1)], "val_neg": cnt[("val", 0)],
-              "calib_neg": cnt[("calib", 0)], "test_pos": cnt[("test", 1)], "test_neg": cnt[("test", 0)]}
-    short = {k: (actual[k], v) for k, v in min_counts.items() if actual.get(k, 0) < v}
+    actual = {f"{split}_{'pos' if lab else 'neg'}": cnt[(split, lab)] for split in PARTITIONS for lab in (1, 0)}
+    short = {k: (actual.get(k, 0), v) for k, v in min_counts.items() if actual.get(k, 0) < v}
     if short:
         raise DatasetMissing(f"window counts below minimum (actual, required): {short}")
 
 
-def split_indices(rows, split: str) -> np.ndarray:
+def split_indices(rows, split: str, *, allow_test: bool = False) -> np.ndarray:
+    if split == "test" and not allow_test:
+        raise TestSplitAccess("the test split is read only by v5/export.py (pass allow_test=True there)")
     return np.array([r["id"] for r in rows if r["split"] == split], dtype=int)
 
 
@@ -1308,7 +1419,7 @@ def read_manifest(path) -> list[dict]:
         return [{k: (int(v) if k in INT_COLS else v) for k, v in row.items()} for row in csv.DictReader(fh)]
 
 
-def _report(rows, exact_dups, dropped, members, path) -> None:
+def _report(rows, exact_dups, exact_conflicts, dropped, members, path) -> None:
     exact_pairs = Counter(tuple(sorted((d["kept_source"], d["source"]))) for d in exact_dups)
     near_pairs = Counter()
     for srcs in members.values():
@@ -1316,7 +1427,7 @@ def _report(rows, exact_dups, dropped, members, path) -> None:
         for i in range(len(u)):
             for j in range(i + 1, len(u)):
                 near_pairs[(u[i], u[j])] += 1
-    lines = ["# Manifest report", "", f"windows kept: {len(rows)}; exact duplicates discarded: {len(exact_dups)}",
+    lines = ["# Manifest report", "", f"windows kept: {len(rows)}; exact duplicates discarded: {len(exact_dups)}; exact-duplicate waveforms with conflicting labels: {len(exact_conflicts)}",
              f"near-duplicate clusters with more than one member: {sum(1 for m in members.values() if len(m) > 1)}", "", LEAKAGE_STATEMENT, "",
              "exact duplicates across sources (kept ~ discarded):"]
     lines += [f"- {a} ~ {b}: {n}" for (a, b), n in sorted(exact_pairs.items())] or ["- none"]
@@ -1335,15 +1446,18 @@ def _report(rows, exact_dups, dropped, members, path) -> None:
 
 def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bool = False) -> list[dict]:
     out_dir = Path(out_dir)
-    if reuse_cache and (out_dir / "cache" / "rows.json").exists():
-        rows, audio, feats = load_cache(out_dir)
-    else:
-        rows, audio, feats = build_cache(data_dir, out_dir, cfg, seed)
     d = cfg.get("data", {})
+    check_dataset_root(data_dir)
+    meta = out_dir / "cache" / "meta.json"
+    fresh = reuse_cache and meta.exists() and json.loads(meta.read_text(encoding="utf-8")).get("fingerprint") == cache_fingerprint(data_dir, d)
+    if reuse_cache and not fresh:
+        print("[manifest] cache fingerprint mismatch or missing: rebuilding")
+    rows, audio, feats = load_cache(out_dir) if fresh else build_cache(data_dir, out_dir, cfg, seed)
     clusters = near_dup_clusters(feats, float(d.get("near_dup_threshold", 0.98)))
     for r, c in zip(rows, clusters):
         r["dup_cluster"] = int(c)
-    split, dropped = enforce_cluster_rule(rows, assign_splits(rows, d, seed))
+    exact_conflicts = set(load_exact_conflicts(out_dir))
+    split, dropped = resolve_partitions(rows, assign_splits(rows, d, seed), exact_conflicts)
     for r, s in zip(rows, split):
         r["split"] = s
     check_invariants(rows)
@@ -1352,7 +1466,7 @@ def build_manifest(data_dir, out_dir, cfg: dict, seed: int = 42, reuse_cache: bo
     for r in rows:
         members[r["dup_cluster"]].append(r["source"])
     write_manifest(rows, out_dir / "manifest.csv")
-    _report(rows, load_exact_dups(out_dir), dropped, members, out_dir / "manifest_report.md")
+    _report(rows, load_exact_dups(out_dir), sorted(exact_conflicts), dropped, members, out_dir / "manifest_report.md")
     return rows
 
 
@@ -1373,13 +1487,13 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv-mac/bin/python -m pytest tests/test_manifest.py -v`
-Expected: PASS
+Expected: PASS (the `only_the_exporter` test passes trivially until export.py exists; it keeps passing once export.py is the only user)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add v5/data/manifest.py tests/test_manifest.py
-git commit -m "feat(v5): manifest with content dedup, immutable split and fail-closed checks"
+git commit -m "feat(v5): manifest with content dedup, isolated immutable split and fail-closed checks"
 ```
 ### Task 6: Waveform augmentation
 
@@ -1388,7 +1502,7 @@ git commit -m "feat(v5): manifest with content dedup, immutable split and fail-c
 
 **Interfaces:**
 - Consumes: `v5.features` (`SR`, `WIN`, `N_MELS`, `N_FRAMES`).
-- Produces: `make_rir(rng, fs=16000, max_len=8000) -> np.ndarray`, `class RirBank(rirs: list[np.ndarray])` with `generate(n, seed, max_len=8000)`, `save(path)`, `load_or_generate(path, n, seed)`, `random(rng) -> np.ndarray`, `__len__`; `apply_rir(x, h) -> np.ndarray`; `rms(x) -> float`; `mix_noise(x, noise, snr_db) -> np.ndarray`; `spectral_tilt(x, a, fc=1000.0) -> np.ndarray`; `time_shift(x, shift_samples) -> np.ndarray`; `gain_clip(x, gain_db) -> np.ndarray`; `spec_augment(X, rng, max_f=4, max_t=8) -> np.ndarray`; `@dataclass AugmentConfig`; `class Augmenter(cfg: AugmentConfig, noise_bank: np.ndarray (M,16000) float32 or int16, rir_bank: RirBank | None, rng)` with `waveform(x, label) -> np.ndarray` and `features(X) -> np.ndarray`; `AugmentConfig.from_dict(d) -> AugmentConfig`.
+- Produces: `make_rir(rng, fs=16000, max_len=8000) -> np.ndarray`, `class RirBank(rirs: list[np.ndarray])` with `generate(n, seed, max_len=8000)`, `save(path)`, `load_or_generate(path, n, seed)`, `random(rng) -> np.ndarray`, `__len__`; `apply_rir(x, h) -> np.ndarray`; `rms(x) -> float`; `mix_noise(x, noise, snr_db) -> np.ndarray`; `spectral_tilt(x, a, fc=1000.0) -> np.ndarray`; `time_shift(x, shift_samples) -> np.ndarray`; `gain_clip(x, gain_db) -> np.ndarray`; `spec_augment(X, rng, max_f=4, max_t=8) -> np.ndarray`; `@dataclass AugmentConfig`; `class Augmenter(cfg: AugmentConfig, noise_bank: np.ndarray (M,16000) float32 or int16, rir_bank: RirBank | None, rng)` with `waveform(x, label, rng=None) -> np.ndarray` and `features(X, rng=None) -> np.ndarray` (an explicit `rng` overrides the stored one); `AugmentConfig.from_dict(d) -> AugmentConfig`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1459,6 +1573,8 @@ def test_augmenter_is_seed_deterministic_and_keeps_shape():
     assert y1.shape == (F.WIN,) and y1.dtype == np.float32 and np.array_equal(y1, y2)
     X = F.extract(y1)
     assert a1.features(X).shape == X.shape
+    e1, e2 = a1.waveform(x, 1, np.random.default_rng([7, 1])), a2.waveform(x, 1, np.random.default_rng([7, 1]))
+    assert np.array_equal(e1, e2)  # explicit generators make single draws reproducible
 
 
 def test_augment_config_from_dict_roundtrip():
@@ -1618,8 +1734,9 @@ class Augmenter:
         # int16 banks are kept as-is and converted per pick (a float copy of 8k windows is 500 MB)
         self.noise_bank = np.asarray(noise_bank) if noise_bank is not None and len(noise_bank) else None
 
-    def waveform(self, x, label: int) -> np.ndarray:
-        c, rng = self.cfg, self.rng
+    def waveform(self, x, label: int, rng=None) -> np.ndarray:
+        """Augment one waveform. Pass an explicit generator for reproducible per-sample draws."""
+        c, rng = self.cfg, (rng if rng is not None else self.rng)
         y = np.asarray(x, dtype=np.float32)
         if self.rir_bank is not None and len(self.rir_bank) and rng.random() < c.p_rir:
             y = apply_rir(y, self.rir_bank.random(rng))
@@ -1637,9 +1754,10 @@ class Augmenter:
             y = gain_clip(y, float(rng.uniform(*c.gain_range)))
         return y.astype(np.float32)
 
-    def features(self, X) -> np.ndarray:
-        if self.rng.random() < self.cfg.p_specaug:
-            return spec_augment(X, self.rng)
+    def features(self, X, rng=None) -> np.ndarray:
+        rng = rng if rng is not None else self.rng
+        if rng.random() < self.cfg.p_specaug:
+            return spec_augment(X, rng)
         return np.asarray(X, dtype=np.float32)
 ```
 
@@ -1656,14 +1774,15 @@ git commit -m "feat(v5): waveform augmentation with RIR bank and noise mixing"
 ```
 
 ---
-### Task 7: Keras dataset with balanced batches
+### Task 7: Keras dataset with balanced batches and reproducible per-sample augmentation
 
 **Files:**
 - Create: `v5/data/dataset.py`, `tests/test_dataset.py`
 
 **Interfaces:**
-- Consumes: `v5.features` (`extract`, `int16_to_float`, `N_FRAMES`, `N_MELS`), `v5.data.augment.Augmenter`.
-- Produces: `class TrainDataset(keras.utils.PyDataset)` constructed as `TrainDataset(audio_i16, y, soft, augmenter, batch=64, pos_frac=1/3, seed=42, workers=1)`, `__len__`, `__getitem__(i) -> (X (B,61,30,1) float32, T (B,2) float32)` where `T[:,0] = y` and `T[:,1] = soft`; `on_epoch_end()` reshuffles; `precompute_features(audio_i16) -> np.ndarray (N,61,30,1)`.
+- Consumes: `v5.features` (`extract`, `int16_to_float`, `N_FRAMES`, `N_MELS`), `v5.data.augment.Augmenter` (`waveform(x, label, rng)`, `features(X, rng)`).
+- Produces: `class TrainDataset(keras.utils.PyDataset)` constructed as `TrainDataset(audio_i16, y, soft, augmenter, batch=64, pos_frac=1/3, seed=42, workers=1)`, `__len__`, `__getitem__(i) -> (X (B,61,30,1) float32, T (B,2) float32)` where `T[:,0] = y` and `T[:,1] = soft`; `on_epoch_end()` reshuffles and increments `epoch`; `precompute_features(audio_i16) -> np.ndarray (N,61,30,1)`.
+- Reproducibility: the augmentation of sample slot `k` of batch `i` in epoch `e` uses `np.random.default_rng([seed, e, i, k])`, so batches are identical across runs regardless of the worker count or fetch order; the shuffle order per epoch comes from a separate generator seeded once.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1681,12 +1800,15 @@ def _audio(n, seed=0):
     return F.float_to_int16(0.05 * rng.standard_normal((n, F.WIN)))
 
 
+def _aug(seed=0):
+    return A.Augmenter(A.AugmentConfig(p_rir=0.0), _audio(3, 9), None, np.random.default_rng(seed))
+
+
 def test_batches_are_balanced_and_shaped():
     audio = _audio(90)
     y = np.array([1] * 30 + [0] * 60, np.float32)
     soft = np.linspace(0, 1, 90).astype(np.float32)
-    aug = A.Augmenter(A.AugmentConfig(p_rir=0.0), None, None, np.random.default_rng(0))
-    ds = D.TrainDataset(audio, y, soft, aug, batch=30, pos_frac=1 / 3, seed=0)
+    ds = D.TrainDataset(audio, y, soft, _aug(), batch=30, pos_frac=1 / 3, seed=0)
     assert len(ds) == 3  # ceil(60 negatives / 20 per batch)
     X, T = ds[0]
     assert X.shape == (30, F.N_FRAMES, F.N_MELS, 1) and X.dtype == np.float32
@@ -1694,15 +1816,25 @@ def test_batches_are_balanced_and_shaped():
     assert np.all((T[:, 1] >= 0) & (T[:, 1] <= 1))
 
 
-def test_epoch_reshuffle_changes_order_but_not_content():
+def test_batches_are_identical_across_instances_and_worker_counts():
+    audio = _audio(60)
+    y = np.array([1] * 20 + [0] * 40, np.float32)
+    a = D.TrainDataset(audio, y, y, _aug(1), batch=30, seed=3, workers=1)
+    b = D.TrainDataset(audio, y, y, _aug(2), batch=30, seed=3, workers=4)
+    for i in range(len(a)):
+        assert np.array_equal(a[i][0], b[i][0]) and np.array_equal(a[i][1], b[i][1])
+    assert np.array_equal(a[1][0], a[1][0])  # fetching the same batch twice gives the same augmentation
+
+
+def test_epoch_reshuffle_changes_batches_but_not_content():
     audio = _audio(30)
     y = np.array([1] * 10 + [0] * 20, np.float32)
-    aug = A.Augmenter(A.AugmentConfig(p_rir=0.0, p_noise_pos=0.0, p_noise_neg=0.0, p_tilt=0.0, p_shift=0.0, p_gain=0.0, p_specaug=0.0), None, None, np.random.default_rng(0))
-    ds = D.TrainDataset(audio, y, y, aug, batch=30, seed=1)
+    quiet = A.Augmenter(A.AugmentConfig(p_rir=0.0, p_noise_pos=0.0, p_noise_neg=0.0, p_tilt=0.0, p_shift=0.0, p_gain=0.0, p_specaug=0.0), None, None, np.random.default_rng(0))
+    ds = D.TrainDataset(audio, y, y, quiet, batch=30, seed=1)
     X1, _ = ds[0]
     ds.on_epoch_end()
     X2, _ = ds[0]
-    assert not np.array_equal(X1, X2)
+    assert ds.epoch == 1 and not np.array_equal(X1, X2)
     assert np.allclose(np.sort(X1.sum(axis=(1, 2, 3))), np.sort(X2.sum(axis=(1, 2, 3))), atol=1e-3)
 
 
@@ -1719,7 +1851,7 @@ Expected: FAIL with `ImportError`
 - [ ] **Step 3: Implement `v5/data/dataset.py`**
 
 ```python
-"""Keras data pipeline: on-the-fly augmentation, 1:2 balanced batches (spec 4.4, 5)."""
+"""Keras data pipeline: reproducible on-the-fly augmentation, 1:2 balanced batches (spec 4.4, 5)."""
 from __future__ import annotations
 
 import math
@@ -1745,7 +1877,9 @@ class TrainDataset(keras.utils.PyDataset):
         self.batch = batch
         self.n_pos_b = max(1, int(round(batch * pos_frac)))
         self.n_neg_b = batch - self.n_pos_b
-        self.rng = np.random.default_rng(seed)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.shuffle_rng = np.random.default_rng([self.seed, 0xB00])
         self.pos = np.nonzero(self.y == 1)[0]
         self.neg = np.nonzero(self.y == 0)[0]
         if len(self.pos) == 0 or len(self.neg) == 0:
@@ -1753,8 +1887,8 @@ class TrainDataset(keras.utils.PyDataset):
         self._shuffle()
 
     def _shuffle(self) -> None:
-        self.pos_order = self.rng.permutation(self.pos)
-        self.neg_order = self.rng.permutation(self.neg)
+        self.pos_order = self.shuffle_rng.permutation(self.pos)
+        self.neg_order = self.shuffle_rng.permutation(self.neg)
 
     def __len__(self) -> int:
         return int(math.ceil(len(self.neg) / self.n_neg_b))
@@ -1767,12 +1901,14 @@ class TrainDataset(keras.utils.PyDataset):
         idx = np.concatenate([self._take(self.pos_order, i * self.n_pos_b, self.n_pos_b), self._take(self.neg_order, i * self.n_neg_b, self.n_neg_b)])
         X = np.empty((len(idx), F.N_FRAMES, F.N_MELS, 1), np.float32)
         for k, j in enumerate(idx):
-            x = self.aug.waveform(F.int16_to_float(self.audio[j]), int(self.y[j]))
-            X[k, :, :, 0] = self.aug.features(F.extract(x))
+            rng = np.random.default_rng([self.seed, self.epoch, int(i), int(k)])
+            x = self.aug.waveform(F.int16_to_float(self.audio[j]), int(self.y[j]), rng)
+            X[k, :, :, 0] = self.aug.features(F.extract(x), rng)
         T = np.stack([self.y[idx], self.soft[idx]], axis=1).astype(np.float32)
         return X, T
 
     def on_epoch_end(self) -> None:
+        self.epoch += 1
         self._shuffle()
 ```
 
@@ -1785,10 +1921,8 @@ Expected: PASS
 
 ```bash
 git add v5/data/dataset.py tests/test_dataset.py
-git commit -m "feat(v5): balanced Keras dataset with on-the-fly augmentation"
+git commit -m "feat(v5): balanced Keras dataset with reproducible per-sample augmentation"
 ```
-
----
 ### Task 8: Student model
 
 **Files:**
@@ -1892,7 +2026,7 @@ git commit -m "feat(v5): student CNN builder"
 - Create: `v5/teacher.py`, `tests/test_teacher.py`
 
 **Interfaces:**
-- Consumes: `v5.features.int16_to_float`, `v5.data.manifest.load_cache`.
+- Consumes: `v5.features.int16_to_float`, `v5.data.manifest` (`load_cache`, `read_manifest`, `split_indices`). Only training-split windows are scored; the manifest must exist first.
 - Produces: `YAMNET_URL`, `load_yamnet() -> tuple[model | None, list[int]]`, `class_names(model) -> list[str]`, `logit(p) -> np.ndarray`, `score_windows(model, idx, audio_i16) -> np.ndarray[float64] z`, `platt_fit(z, y) -> tuple[float, float]`, `platt_apply(z, a, b) -> np.ndarray`, `audit_flags(z, y, weak=0.02, contaminated=0.5) -> list[str]`, `write_scores(path, ids, z, flags)`, `read_scores(path) -> dict[int, tuple[float, str]]`.
 - File: `output/v5/teacher.csv` with columns `id,z,flag`.
 
@@ -2039,9 +2173,9 @@ def read_scores(path) -> dict[int, tuple[float, str]]:
 
 
 def main(argv=None) -> None:
-    from v5.data.manifest import load_cache
+    from v5.data.manifest import load_cache, read_manifest, split_indices
 
-    ap = argparse.ArgumentParser(description="Score cached windows with YAMNet")
+    ap = argparse.ArgumentParser(description="Score training windows with YAMNet (never the test split)")
     ap.add_argument("--config", default=None)
     args = ap.parse_args(argv)
     cfg = resolve(load_config(args.config))
@@ -2049,11 +2183,13 @@ def main(argv=None) -> None:
     model, idx = load_yamnet()
     if model is None:
         return
-    rows, audio, _ = load_cache(out)
-    z = score_windows(model, idx, audio)
-    flags = audit_flags(z, [r["label"] for r in rows])
-    write_scores(out / "teacher.csv", [r["id"] for r in rows], z, flags)
-    print(f"[teacher] wrote {out / 'teacher.csv'}; flags: {dict(Counter(f for f in flags if f))}")
+    rows = read_manifest(out / "manifest.csv")
+    _, audio, _ = load_cache(out)
+    train_ids = split_indices(rows, "train")
+    z = score_windows(model, idx, audio[train_ids])
+    flags = audit_flags(z, [rows[i]["label"] for i in train_ids])
+    write_scores(out / "teacher.csv", train_ids, z, flags)
+    print(f"[teacher] scored {len(train_ids)} training windows -> {out / 'teacher.csv'}; flags: {dict(Counter(f for f in flags if f))}")
 
 
 if __name__ == "__main__":
@@ -2710,7 +2846,7 @@ git commit -m "data(v5): training experiments, validation selection and calibrat
 
 **Interfaces:**
 - Produces: `IDLE, ACTIVE, CONFIRMED` state strings; `@dataclass(frozen=True) FsmParams(tau=0.65, tick_ms=500, hold_ticks=12, confirm_ticks=20, verify_ticks=30, min_bursts=3, period_min_ticks=3, period_max_ticks=14)` with `FsmParams.from_config(tau, fsm_cfg: dict)` and `to_dict()`; `class EpisodeFsm(params)` with `reset()`, `tick(p: float, level_dbfs: float = 0.0) -> dict | None`, attributes `state`, `active`, `activity`, `tick_i`, `last_episode`; `run_sequence(p_seq, params, levels=None) -> tuple[list[dict], list[str], list[bool]]`.
-- Event dicts: `{"type": "episode_start", "tick", "t", "n_bursts"}` and `{"type": "episode_end", "tick", "t", "start_t", "duration_s", "mean_p", "n_bursts", "n_hits", "level_dbfs"}` where `t = tick * tick_ms / 1000` is the window start time. Episode statistics (`mean_p`, `n_hits`, `level_dbfs`) cover every hit from the first retained burst onward, including hits before confirmation.
+- Event dicts: `{"type": "episode_start", "episode_id", "tick", "t", "n_bursts"}` and `{"type": "episode_end", "episode_id", "tick", "t", "start_t", "duration_s", "mean_p", "n_bursts", "n_hits", "level_dbfs"}` (`episode_id` counts confirmed episodes from 1 and pairs each end with its start) where `t = tick * tick_ms / 1000` is the window start time. Episode statistics (`mean_p`, `n_hits`, `level_dbfs`) cover every hit from the first retained burst onward, including hits before confirmation.
 - Implementation details shared with the C code: streak is capped at `4 * confirm_ticks`; candidate hits are kept in a history pruned by the same age rule as burst starts (`confirm_ticks + hold_ticks`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2737,7 +2873,7 @@ def test_params_from_config_rounds_seconds_to_ticks():
 def test_periodic_snoring_confirms_at_tick_19_with_three_bursts():
     events, states, actives = S.run_sequence(periodic_pattern(), S.FsmParams())
     starts = [e for e in events if e["type"] == "episode_start"]
-    assert len(starts) == 1 and starts[0]["tick"] == 19 and starts[0]["n_bursts"] == 3
+    assert len(starts) == 1 and starts[0]["tick"] == 19 and starts[0]["n_bursts"] == 3 and starts[0]["episode_id"] == 1
     assert states[18] == S.ACTIVE and states[19] == S.CONFIRMED
 
 
@@ -2747,7 +2883,7 @@ def test_episode_end_active_flag_and_statistics():
     events, states, actives = S.run_sequence(seq, S.FsmParams(), levels)
     assert actives[34] and actives[46] and not actives[47]  # hold = 12 ticks after the last hit
     ends = [e for e in events if e["type"] == "episode_end"]
-    assert len(ends) == 1 and ends[0]["tick"] == 76  # 47 + 30 - 1
+    assert len(ends) == 1 and ends[0]["tick"] == 76 and ends[0]["episode_id"] == 1  # 47 + 30 - 1
     assert ends[0]["duration_s"] == (34 - 0 + 2) * 0.5 and ends[0]["n_bursts"] == 5
     assert ends[0]["n_hits"] == 15  # 5 bursts x 3 hits, including the hits before confirmation
     assert abs(ends[0]["mean_p"] - 0.9) < 1e-9 and ends[0]["level_dbfs"] == -30.0 and states[76] == S.IDLE
@@ -2851,6 +2987,7 @@ class EpisodeFsm:
         self.below_ticks = 0
         self.ep = None
         self.last_episode = None
+        self.episode_count = 0
 
     def _periodic(self) -> bool:
         starts = list(self.burst_starts)
@@ -2894,9 +3031,10 @@ class EpisodeFsm:
                 sel = [h for h in self.hits if h[0] >= first]
                 self.state = CONFIRMED
                 self.below_ticks = 0
+                self.episode_count += 1
                 self.ep = {"first_burst_tick": first, "last_hit_tick": sel[-1][0] if sel else i, "n_bursts": len(self.burst_starts),
                            "sum_p": sum(h[1] for h in sel), "n_hits": len(sel), "sum_level": sum(h[2] for h in sel)}
-                event = {"type": "episode_start", "tick": i, "t": i * P.tick_ms / 1000.0, "n_bursts": self.ep["n_bursts"]}
+                event = {"type": "episode_start", "episode_id": self.episode_count, "tick": i, "t": i * P.tick_ms / 1000.0, "n_bursts": self.ep["n_bursts"]}
         elif self.state == CONFIRMED:
             if hit:
                 self.ep["last_hit_tick"] = i
@@ -2910,7 +3048,7 @@ class EpisodeFsm:
                 if self.below_ticks >= P.verify_ticks:
                     ep, n = self.ep, max(self.ep["n_hits"], 1)
                     duration_ticks = ep["last_hit_tick"] - ep["first_burst_tick"] + 2  # one window = 2 ticks
-                    event = {"type": "episode_end", "tick": i, "t": i * P.tick_ms / 1000.0, "start_t": ep["first_burst_tick"] * P.tick_ms / 1000.0,
+                    event = {"type": "episode_end", "episode_id": self.episode_count, "tick": i, "t": i * P.tick_ms / 1000.0, "start_t": ep["first_burst_tick"] * P.tick_ms / 1000.0,
                              "duration_s": duration_ticks * P.tick_ms / 1000.0, "mean_p": ep["sum_p"] / n, "n_bursts": ep["n_bursts"],
                              "n_hits": ep["n_hits"], "level_dbfs": ep["sum_level"] / n}
                     self.last_episode = event
@@ -3109,8 +3247,8 @@ git commit -m "feat(v5): synthetic night generator"
 **Interfaces:**
 - Consumes: `v5.features`, `v5.nights`, `v5.streaming` (`EpisodeFsm`, `FsmParams`), `v5.evaluate` (`predict_probs`, `int8_probs`, `make_distance_rirs`), `v5.data.manifest`, `v5.data.sources.decode`.
 - Produces: `window_features(audio, hop=8000) -> np.ndarray (n,61,30,1)`, `tick_end_time(tick, tick_s=0.5) -> float` (= `(tick + 2) * tick_s`), `run_fsm(p_seq, params) -> tuple[list[dict], list[bool]]` (events carry `t_end`), `match_events(events, episodes, tol_s) -> tuple[list[tuple[int, dict]], list[dict]]`, `score_night(events, actives, episodes, tick_s=0.5, tol_s=5.0, duration_s=3600.0) -> dict` (keys `n_episodes, detected, detection_rate, confirm_latency_mean_s, confirm_latency_p90_s, false_confirms, false_confirms_per_hour, stop_latency_mean_s, stop_latency_p90_s, end_event_delay_mean_s`), `run_benchmark(predictors: dict[str, callable], params, cfg, seed=0) -> dict`, `to_markdown(result) -> str`, CLI `python -m v5.benchmark_nights [--model ..] [--tflite ..] [--threshold ..]`.
-- Matching rule: episode_start events are processed in time order; each is assigned to the earliest unmatched episode whose window `[s - tol_s, e + tol_s]` contains the event's `t_end`; unassigned events are false confirms; unassigned episodes are misses. Latency is `max(0, t_end - s)`.
-- Night material: snore and distractor windows come from the untouched `test` split; beds from `bench` MS-SNSD files. The int8 predictor is the product path; the float predictor is reported for reference together with the tick-level decision agreement between the two.
+- Matching rule: episode_start events are processed in time order; each is assigned to the earliest unmatched episode whose window `[s - tol_s, e + tol_s]` contains the event's `t_end`; unassigned events are false confirms; unassigned episodes are misses. Latency is `max(0, t_end - s)`. Stop latency uses the first tick at or after the matched start event where `active` is false, clamped at zero when that falls before the labelled end; the end-event delay uses the `episode_end` carrying the same `episode_id` (nan when absent).
+- Night material: snore and distractor windows come from the `bench` partition (WHLTalent validation-batch recordings reserved for benchmarking plus MS-SNSD bench windows); beds from `bench` MS-SNSD files. The benchmark never reads the `test` split (`split_indices` would raise). The int8 predictor is the product path; the float predictor is reported for reference together with the tick-level decision agreement between the two.
 - Files: `output/v5/benchmark_nights.json`, `output/v5/deliverables/benchmark_nights.md`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3158,15 +3296,17 @@ def test_run_fsm_and_score_on_oracle_probabilities():
 
 def test_match_events_is_one_to_one_with_one_tolerance():
     episodes = [(120.0, 150.0)]
-    early = {"type": "episode_start", "tick": 0, "t_end": 116.0}   # inside s - tol
-    second = {"type": "episode_start", "tick": 0, "t_end": 140.0}  # same episode, already matched
-    far = {"type": "episode_start", "tick": 0, "t_end": 51.0}
+    early = {"type": "episode_start", "episode_id": 3, "tick": 228, "t_end": 116.0}   # inside s - tol
+    second = {"type": "episode_start", "episode_id": 4, "tick": 276, "t_end": 140.0}  # same episode, already matched
+    far = {"type": "episode_start", "episode_id": 1, "tick": 98, "t_end": 51.0}
     matches, unmatched = B.match_events([far, second, early], episodes, tol_s=5.0)
     assert [j for j, _ in matches] == [0] and matches[0][1] is early
     assert unmatched == [far, second]
     m = B.score_night([far, second, early], [False] * 400, episodes, duration_s=100.0)
     assert m["detected"] == 1 and m["false_confirms"] == 2 and m["false_confirms_per_hour"] == 72.0
     assert m["confirm_latency_mean_s"] == 0.0  # early event clamps to zero latency
+    assert m["stop_latency_mean_s"] == 0.0  # active already low: clamped, not negative
+    assert np.isnan(m["end_event_delay_mean_s"])  # no episode_end with id 3
 
 
 def test_run_benchmark_with_fake_predictors(mini_dataset, tmp_path):
@@ -3175,7 +3315,8 @@ def test_run_benchmark_with_fake_predictors(mini_dataset, tmp_path):
     cfg["data"]["near_dup_threshold"] = 0.999
     cfg["data"]["min_counts"] = dict(TINY_MIN)
     cfg["benchmark"] = {"n_nights": 2, "night_s": 90, "snrs": [10]}
-    M.build_manifest(cfg["paths"]["data_dir"], cfg["paths"]["out_dir"], cfg)
+    rows = M.build_manifest(cfg["paths"]["data_dir"], cfg["paths"]["out_dir"], cfg)
+    assert any(r["split"] == "bench" and r["label"] == 1 for r in rows)
     zeros = lambda X: np.zeros(len(X))
     ones = lambda X: np.full(len(X), 0.9)
     result = B.run_benchmark({"float": zeros, "int8": ones}, FsmParams(), cfg, seed=0)
@@ -3255,19 +3396,19 @@ def _stats(values):
 def score_night(events, actives, episodes, tick_s: float = 0.5, tol_s: float = 5.0, duration_s: float = 3600.0) -> dict:
     matches, unmatched = match_events(events, episodes, tol_s)
     matched = dict(matches)
-    ends = [e for e in events if e["type"] == "episode_end"]
+    ends_by_id = {ev.get("episode_id"): ev for ev in events if ev["type"] == "episode_end"}
     latency, stop_lat, end_delay = [], [], []
     for j, (s, e) in enumerate(episodes):
         if j not in matched:
             continue
-        latency.append(max(0.0, matched[j]["t_end"] - s))
-        k0 = int(np.ceil(e / tick_s))
-        drop = next((k for k in range(k0, len(actives)) if not actives[k]), None)
+        start_ev = matched[j]
+        latency.append(max(0.0, start_ev["t_end"] - s))
+        drop = next((k for k in range(int(start_ev["tick"]), len(actives)) if not actives[k]), None)
         if drop is not None:
-            stop_lat.append(tick_end_time(drop, tick_s) - e)
-        later_end = next((ev for ev in ends if ev["t_end"] >= e), None)
-        if later_end is not None:
-            end_delay.append(later_end["t_end"] - e)
+            stop_lat.append(max(0.0, tick_end_time(drop, tick_s) - e))
+        end_ev = ends_by_id.get(start_ev.get("episode_id"))
+        if end_ev is not None:
+            end_delay.append(max(0.0, end_ev["t_end"] - e))
     lat_m, lat_p90 = _stats(latency)
     stop_m, stop_p90 = _stats(stop_lat)
     hours = duration_s / 3600.0
@@ -3304,8 +3445,12 @@ def run_benchmark(predictors: dict, params: FsmParams, cfg: dict, seed: int = 0)
     beds = _bench_beds(rows, cfg["paths"]["data_dir"])
     if not beds:
         raise RuntimeError("no bench MS-SNSD files in the manifest")
-    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 1]])
-    distract = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 0]])
+    snore_ids = [r["id"] for r in rows if r["split"] == "bench" and r["label"] == 1]
+    distract_ids = [r["id"] for r in rows if r["split"] == "bench" and r["label"] == 0 and r["source"] != "mssnsd"]
+    if not snore_ids or not distract_ids:
+        raise RuntimeError("bench partition has no snore or distractor windows")
+    snore = F.int16_to_float(audio[snore_ids])
+    distract = F.int16_to_float(audio[distract_ids])
     bcfg = cfg["benchmark"]
     snrs, n_nights, night_s = list(bcfg["snrs"]), int(bcfg["n_nights"]), float(bcfg["night_s"])
     rirs = make_distance_rirs(1.0, n=3, seed=seed)
@@ -3336,7 +3481,7 @@ def run_benchmark(predictors: dict, params: FsmParams, cfg: dict, seed: int = 0)
 
 
 def to_markdown(result: dict) -> str:
-    lines = ["# Streaming benchmark (synthetic nights from the test split)", "", f"FSM params: `{json.dumps(result['params'])}`", ""]
+    lines = ["# Streaming benchmark (synthetic nights from the bench partition)", "", f"FSM params: `{json.dumps(result['params'])}`", ""]
     for name, by_snr in result["by_snr"].items():
         lines += [f"## predictor: {name}", "", "| SNR dB | nights | detection | confirm latency s | false confirms / h | stop latency s |", "|---|---|---|---|---|---|"]
         for snr, m in by_snr.items():
@@ -3753,7 +3898,7 @@ def main(argv=None) -> None:
     out = Path(cfg["paths"]["out_dir"])
     rows = M.read_manifest(out / "manifest.csv")
     _, audio, _ = M.load_cache(out)
-    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "test" and r["label"] == 1]])
+    snore = F.int16_to_float(audio[[r["id"] for r in rows if r["split"] == "bench" and r["label"] == 1]])  # never the test split
     result = run_sweep(snore, trials=args.trials, seed=cfg["seed"])
     (out / "doa_sim.json").write_text(json.dumps(result, indent=1))
     (out / "deliverables").mkdir(parents=True, exist_ok=True)
@@ -3929,6 +4074,7 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
 - Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees.
 - Release gates (all must pass before anything is promoted): TFLite input/output are int8 with shapes `[1,61,30,1]` and `[1,1]`; operator set ⊆ `ALLOWED_TFLITE_OPS` (when the interpreter exposes op details); int8 parity on the test split with `delta_auc < 0.005`, `agreement >= 0.99`, `max_abs_diff <= 0.05`. Artifacts are written to `output/v5/export_stage/` and moved into place only after every gate passes; on failure the stage directory is kept for diagnosis, `deliverables/export_status.json` records `{"status": "failed", "error": ...}`, and previously promoted files are left untouched.
 - Golden formats: `fsm_trace.txt` first line `tau tick_ms hold confirm verify min_bursts pmin pmax`, then per tick `p state active event dur mean_p n_bursts n_hits level` (the last five are zero unless `event == 2`; state IDLE=0, ACTIVE=1, CONFIRMED=2; event none=0, start=1, end=2). `doa_cases.bin`: int32 `n_cases, frame_len, max_lag`, then per case `int16 l[512]`, `int16 r[512]`, `float32 expected_lag`, `float32 expected_ratio`. `doa_tracker.bin`: int32 `n_frames, frame_len`, float32 `spacing_m`, then per frame `int16 l[512]`, `int16 r[512]`, int32 `expected_valid`, float32 `expected_lag`, then a trailer int32 `side_code` (0 unknown, 1 left, 2 right), float32 `lag_samples, lag_ms, conf`, int32 `n_valid`.
 
@@ -3998,18 +4144,44 @@ def test_gates_raise_export_error():
         X.validate_tflite(b"not a model")
 
 
-def test_promote_moves_only_exporter_files(tmp_path):
-    stage, deliv, gen = tmp_path / "stage", tmp_path / "deliv", tmp_path / "gen"
+def _stage(tmp_path, tag):
+    stage = tmp_path / f"stage_{tag}"
     (stage / "golden").mkdir(parents=True)
     for name in X.PROMOTED_FILES:
-        (stage / name).write_text(name)
-    (stage / "golden" / "features.bin").write_bytes(b"x")
+        (stage / name).write_text(f"{name}:{tag}")
+    (stage / "golden" / "features.bin").write_bytes(tag.encode())
+    return stage
+
+
+def _tree(d):
+    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+def test_promote_keeps_other_files_and_is_transactional(tmp_path, monkeypatch):
+    deliv, gen = tmp_path / "deliv", tmp_path / "gen"
     deliv.mkdir()
     (deliv / "experiments.md").write_text("keep me")
-    X.promote(stage, deliv, gen)
+    X.promote(_stage(tmp_path, "v1"), deliv, gen)
     assert (deliv / "experiments.md").read_text() == "keep me"
-    assert (deliv / "snore_v5_int8.tflite").exists() and (deliv / "golden" / "features.bin").exists()
-    assert (gen / "model_meta.h").exists() and not (stage / "snore_v5_int8.tflite").exists()
+    assert (deliv / "snore_v5_int8.tflite").read_text() == "snore_v5_int8.tflite:v1" and (gen / "model_meta.h").read_text() == "model_meta.h:v1"
+    assert (deliv / "golden" / "features.bin").read_bytes() == b"v1" and not (tmp_path / "deliv.new").exists() and not (tmp_path / "deliv.bak").exists()
+    before_deliv, before_gen = _tree(deliv), _tree(gen)
+    import os as _os
+
+    real_rename, calls = _os.rename, {"n": 0}
+
+    def failing_rename(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 4:  # fails while swapping the second (generated) directory, after the first swap succeeded
+            raise OSError("injected failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(X.os, "rename", failing_rename)
+    with pytest.raises(OSError):
+        X.promote(_stage(tmp_path, "v2"), deliv, gen)
+    monkeypatch.setattr(X.os, "rename", real_rename)
+    assert _tree(deliv) == before_deliv and _tree(gen) == before_gen  # previous release fully restored
+    assert not (tmp_path / "deliv.new").exists() and not (tmp_path / "gen.new").exists() and not (tmp_path / "deliv.bak").exists()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -4305,17 +4477,53 @@ def write_headers_only(gen_dir, golden_dir, fsm: FsmParams, doa: DoaParams) -> N
     write_golden_doa_tracker(golden_dir / "doa_tracker.bin", doa)
 
 
+def _build_new_tree(live: Path, new: Path, stage: Path, files, golden: bool) -> None:
+    if new.exists():
+        shutil.rmtree(new)
+    if live.exists():
+        shutil.copytree(live, new)
+    else:
+        new.mkdir(parents=True)
+    for name in files:
+        shutil.copy(stage / name, new / name)
+    if golden:
+        if (new / "golden").exists():
+            shutil.rmtree(new / "golden")
+        shutil.copytree(stage / "golden", new / "golden")
+
+
 def promote(stage, deliv, gen_dir) -> None:
+    """Transactional promotion: complete sibling trees are built first, then both live directories
+    are swapped by rename; any failure rolls both back to the previous release."""
     stage, deliv, gen_dir = Path(stage), Path(deliv), Path(gen_dir)
-    deliv.mkdir(parents=True, exist_ok=True)
-    gen_dir.mkdir(parents=True, exist_ok=True)
-    for name in PROMOTED_FILES:
-        os.replace(stage / name, deliv / name)
-    for name in HEADER_FILES:
-        shutil.copy(deliv / name, gen_dir / name)
-    if (deliv / "golden").exists():
-        shutil.rmtree(deliv / "golden")
-    shutil.move(str(stage / "golden"), str(deliv / "golden"))
+    new_deliv, new_gen = deliv.with_name(deliv.name + ".new"), gen_dir.with_name(gen_dir.name + ".new")
+    _build_new_tree(deliv, new_deliv, stage, PROMOTED_FILES, golden=True)
+    _build_new_tree(gen_dir, new_gen, stage, HEADER_FILES, golden=False)
+    swapped = []
+    try:
+        for live, new in ((deliv, new_deliv), (gen_dir, new_gen)):
+            bak = live.with_name(live.name + ".bak")
+            if bak.exists():
+                shutil.rmtree(bak)
+            if live.exists():
+                os.rename(live, bak)
+                swapped.append((live, bak))
+            else:
+                swapped.append((live, None))
+            os.rename(new, live)
+    except Exception:
+        for live, bak in reversed(swapped):
+            if live.exists():
+                shutil.rmtree(live)
+            if bak is not None and bak.exists():
+                os.rename(bak, live)
+        for new in (new_deliv, new_gen):
+            if new.exists():
+                shutil.rmtree(new)
+        raise
+    for _, bak in swapped:
+        if bak is not None and bak.exists():
+            shutil.rmtree(bak)
 
 
 def _write_status(deliv: Path, status: str, **extra) -> None:
@@ -4347,7 +4555,7 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         rows = M.read_manifest(out / "manifest.csv")
         _, audio, _ = M.load_cache(out)
         y = np.array([r["label"] for r in rows])
-        tr, te = M.split_indices(rows, "train"), M.split_indices(rows, "test")
+        tr, te = M.split_indices(rows, "train"), M.split_indices(rows, "test", allow_test=True)  # the single sanctioned read of the test split
         rng = np.random.default_rng(cfg["seed"])
         tflite = to_tflite_int8(model, precompute_features(audio[rng.choice(tr, size=min(500, len(tr)), replace=False)]))
         valid = validate_tflite(tflite)
@@ -5485,6 +5693,7 @@ git commit -m "feat(v5): self-recording kit with chunked WAV writer and label te
 
 **Interfaces:**
 - Consumes: `v5.data.sources.decode`, `v5.data.augment` (`AugmentConfig`, `Augmenter`), `v5.data.dataset` (`TrainDataset`, `precompute_features`), `v5.evaluate` (`clip_metrics`, `predict_probs`), `v5.events.check_model_version`, `v5.train.kd_loss`.
+- Output is a non-deployable candidate (`deployable: false`): score calibration changes with fine-tuning, so a candidate must go through `train final` (calibration on the calib split) and the gated exporter before it gets a deployable version.
 - Produces: `LABEL_TO_Y`, `load_labels(session_dir) -> list[dict]`, `slice_session(session_dir, hop_s=1.0) -> tuple[np.ndarray int16 (N,16000), np.ndarray float32 (N,)]`, `finetune(model_path, sessions: list, holdout, out_dir, epochs=10, lr=1e-4, tau=0.65, seed=42) -> dict` (keys `model_version, n_train, n_holdout, before, after`), CLI `python -m v5.finetune --sessions DIR [DIR ...] --holdout DIR [--model PATH] [--out DIR] [--epochs N]`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -5542,7 +5751,7 @@ def test_finetune_smoke(tmp_path):
     model.save(tmp_path / "m.keras")
     a, b = _session(tmp_path / "a", 1), _session(tmp_path / "b", 2)
     m = FT.finetune(tmp_path / "m.keras", [a], b, tmp_path / "out", epochs=1, tau=0.5)
-    assert m["model_version"].startswith("cnn_v5_ft_") and m["n_train"] == 40 and m["n_holdout"] == 40
+    assert m["model_version"].startswith("cnn_v5_ft_candidate_") and m["deployable"] is False and m["n_train"] == 40 and m["n_holdout"] == 40
     assert "auc" in m["before"] and "auc" in m["after"]
     assert (tmp_path / "out" / "model.keras").exists()
     assert json.loads((tmp_path / "out" / "metrics.json").read_text())["n_train"] == 40
@@ -5640,11 +5849,12 @@ def finetune(model_path, sessions, holdout, out_dir, epochs: int = 10, lr: float
     model.compile(optimizer=keras.optimizers.Adam(lr), loss=kd_loss)
     model.fit(ds, epochs=epochs, verbose=2)
     after = clip_metrics(h_y, predict_probs(model, Xh), tau)
-    version = check_model_version(f"cnn_v5_ft_{date.today():%Y%m%d}")
+    version = check_model_version(f"cnn_v5_ft_candidate_{date.today():%Y%m%d}")  # a candidate, not a deployable model
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save(out_dir / "model.keras")
-    metrics = {"model_version": version, "n_train": int(len(y)), "n_holdout": int(len(h_y)), "tau": tau, "epochs": epochs, "before": before, "after": after}
+    metrics = {"model_version": version, "deployable": False, "n_train": int(len(y)), "n_holdout": int(len(h_y)), "tau": tau, "epochs": epochs, "before": before, "after": after,
+               "to_deploy": "copy model.keras to output/v5/runs/<name>/, write selection.json, run `python -m v5.train final` (re-calibrates on the calib split) and `python -m v5.export model` (release gates)"}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
 
@@ -5712,7 +5922,7 @@ Spec: `docs/superpowers/specs/2026-09-04-snore-v5-edge-pipeline-design.md`
     uv venv .venv-mac --python 3.12
     uv pip install --python .venv-mac/bin/python tensorflow tensorflow-hub librosa soundfile soxr scikit-learn scipy pyroomacoustics ai-edge-litert sounddevice pyyaml pytest pydantic "setuptools<81"
 
-Splits: train / val (selection) / calib (threshold) / test (Kaggle, evaluated once at export) / bench (MS-SNSD beds). Release gates in `v5.export` block promotion on int8 parity or operator failures; calibration fails closed on the FPR target.
+Splits: train / val (selection) / calib (threshold) / test (Kaggle, read only by the exporter) / bench (benchmark and DoA material, MS-SNSD beds). Fine-tuned models are candidates only until they pass calibration and the export gates. Release gates in `v5.export` block promotion on int8 parity or operator failures; calibration fails closed on the FPR target.
 
 ## Pipeline, in order
 

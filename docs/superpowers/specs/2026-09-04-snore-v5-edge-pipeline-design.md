@@ -144,27 +144,33 @@ levels. Per-window RMS uses 32 ms frames.
 One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity`, `drop`:
 
 - `train`: WHLTalent batches other than the validation batches, ESC-50 folds 1–3, MS-SNSD training files.
-- `val` (early stopping and model selection): WHLTalent batches `000002` (snore) and `100002`
-  (environment), ESC-50 fold 4, 15 % of the non-bench MS-SNSD files.
+- `val` (early stopping and model selection): half of the recordings of WHLTalent batches `000002`
+  (snore) and `100002` (environment), ESC-50 fold 4, 15 % of the non-bench MS-SNSD files.
 - `calib` (threshold calibration only): ESC-50 fold 5, 15 % of the non-bench MS-SNSD files.
 - `test` (final evaluation, used exactly once by the exporter): the whole Kaggle set. It is never
   used for training, selection, calibration, augmentation banks or synthetic-night material.
-- `bench`: 20 % of MS-SNSD files (seeded 42), used only as benchmark noise beds and robustness noise.
-- Eval windows whose near-duplicate cluster contains a training window are dropped; clusters with
-  conflicting labels are dropped everywhere. Invariants: no group and no cluster may appear in
-  `train` and any evaluation partition; minimum window counts per partition are enforced and a
-  shortfall aborts the build.
+- `bench`: the other half of the WHLTalent validation-batch recordings (snore and environment,
+  recording-disjoint from `val`) plus 20 % of MS-SNSD files (seeded 42). This is the only material
+  for the streaming benchmark and the DoA sweep, and the MS-SNSD part supplies noise beds and
+  robustness noise.
+- Isolation: every group and every near-duplicate cluster lives in exactly one partition; when one
+  spans several, it stays in the highest-priority partition (`test`, `train`, `val`, `calib`, `bench`)
+  and is dropped from the others, so the test set is never altered by the other partitions.
+  Clusters with conflicting labels and exact-duplicate waveforms with conflicting labels are dropped
+  everywhere. Minimum window counts per partition are enforced and a shortfall aborts the build.
+- The test split is readable only by the exporter (`split_indices(..., allow_test=True)`); every
+  other module raises if it asks for it, and a test asserts that `v5/export.py` is the only caller.
 - Leakage statement: WHLTalent has no subject metadata, so the split is batch-disjoint (file-name
   prefix) rather than proven subject-disjoint; ESC-50's official folds keep same-source clips
   together; Kaggle is a separate collection.
 - Class balance: batches are sampled 1:2 positive:negative; loss is unweighted.
 
-Expected volumes: ≈ 2 k positive and ≈ 6 k negative training windows, ≈ 470 validation positives,
-≥ 1 k calibration negatives, ≈ 1 k Kaggle test windows after dedup.
+Expected volumes: ≈ 2 k positive and ≈ 6 k negative training windows, ≈ 235 validation and ≈ 235
+bench positives, ≥ 1 k calibration negatives, ≈ 1 k Kaggle test windows after dedup.
 
 ### 4.5 Label audit (only when the teacher is available)
 
-YAMNet scores on clean windows: positives with `P(Snoring) + P(Snort) < 0.02` are flagged
+YAMNet scores training-split windows only (never validation, calibration, bench or test): positives with `P(Snoring) + P(Snort) < 0.02` are flagged
 `weak_positive` and kept; negatives with `> 0.5` are flagged `snore_in_negative` and excluded
 from training. Flag counts go to `manifest_report.md`.
 
@@ -234,16 +240,17 @@ Int8 parity gate (test split): ΔAUC < 0.005, decision agreement at τ ≥ 99 %,
 Failure blocks the release.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
-test-split snore and distractor windows over bench MS-SNSD beds at −50…−30 dBFS, optional 1 m RIR,
+bench-partition snore and distractor windows over bench MS-SNSD beds at −50…−30 dBFS, optional 1 m RIR,
 6–12 snore episodes of 20–120 s with burst period 2.5–5 s and breathing gaps, 20–40 distractor
 events. The pipeline runs features → predictor → FSM at 2 Hz for both the float model and the
 deployed int8 model; product metrics come from the int8 path and the tick-level decision agreement
 between the two is reported. Scoring matches episode_start events one-to-one and chronologically
 to episodes whose window [start − 5 s, end + 5 s] contains the event time; unmatched events are
-false confirms and unmatched episodes are misses. Metrics: detection rate, confirm latency
-(max(0, event − start)), false confirms per hour, snore-stop latency (true episode end → the FSM's
-`active` flag drops, the signal the intervention loop uses), and the delay of the bookkeeping
-`episode_end` event.
+false confirms and unmatched episodes are misses. Start and end events carry an `episode_id`, so
+each matched start is paired with its own end. Metrics: detection rate, confirm latency
+(max(0, event − start)), false confirms per hour, snore-stop latency (labelled episode end → the
+first tick after the matched start where the FSM's `active` flag is false, clamped at zero), and
+the delay of the paired `episode_end` event.
 
 Provisional targets, reported not promised: detection ≥ 90 %, confirm latency ≤ confirm_seconds
 + 3 s, false confirms ≤ 0.5 per hour at SNR ≥ 5 dB. Results at all SNRs go into the model card
@@ -313,7 +320,9 @@ cloud repo's pydantic `EventIn` when that repo is present on disk (skipped other
 ## 11. Export and firmware contract
 
 `export.py` writes everything into `output/v5/export_stage/` first and promotes it only after every
-release gate passes: TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
+release gate passes. Promotion is transactional: complete sibling trees for `deliverables/` and
+`generated/` are built, then both are swapped in by rename with backups kept until both swaps
+succeed; any failure restores both previous trees. Gates: TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
 set is within {CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED, LOGISTIC, RESHAPE, QUANTIZE,
 DEQUANTIZE}; int8 parity on the test split meets the limits of section 7. A failed gate raises,
 keeps the stage directory for diagnosis, records `failed` in `deliverables/export_status.json` and
@@ -362,10 +371,13 @@ into `recordings/<session>/` with a `labels_template.csv` (`chunk, start_s, end_
 {snore, breathing, speech, tv, fan, other}, side, posture, distance_m, pillow`). Labelling is
 manual.
 
-`finetune.py --session <dir>` slices labelled spans into one-second windows, holds out one
-session, fine-tunes the deployed model at learning rate 1e-4 for 10 epochs with the conv1 block
-frozen, reports before/after metrics on the held-out session, and exports with
-`model_version = "cnn_v5_ft_<date>"`.
+`finetune.py --sessions <dirs> --holdout <dir>` slices labelled spans into one-second windows,
+fine-tunes the deployed model at learning rate 1e-4 for 10 epochs with the conv1 block frozen,
+reports before/after metrics on the held-out session (which must not be a training session;
+overlapping label spans are rejected) and saves a candidate tagged
+`cnn_v5_ft_candidate_<date>` with `deployable: false`. Fine-tuning changes score calibration, so a
+candidate becomes deployable only by going through `train final` (calibration on the calib split)
+and the gated exporter like any other run.
 
 ## 13. Error handling and degraded modes
 
