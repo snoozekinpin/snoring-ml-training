@@ -1,0 +1,49 @@
+# 训练配置文件
+# 酣眠 SnoozMate 鼾声检测模型
+
+data:
+  data_dir: "dataset"
+  sample_rate: 16000
+  duration_sec: 1.0
+  val_split: 0.15
+  test_split: 0.15
+  sample_limit: null  # null = 全部数据
+
+model:
+  n_mels: 30
+  n_fft: 512
+  hop_length: 256
+  f_min: 40
+  f_max: 6000
+  resize_height: 32
+  conv_filters: [32, 64, 128]
+  dense_units: 128
+  dropout: 0.5
+
+training:
+  epochs: 30
+  batch_size: 32
+  learning_rate: 0.001
+  early_stop_patience: 7
+  lr_reduce_patience: 4
+  class_weight: true
+
+augmentation:
+  enabled: true
+  noise_prob: 0.5
+  noise_max_db: 0.15
+  volume_prob: 0.5
+  volume_range: [0.5, 1.3]
+  shift_prob: 0.3
+  shift_max_ms: 100
+  speed_prob: 0.3
+  speed_range: [0.9, 1.1]
+  pitch_prob: 0.2
+  pitch_semitones: 2
+
+output:
+  model_dir: "output/model"
+  esp32_dir: "output/esp32"
+  export_tflite: true
+  export_c_header: true
+  int8_quantize: true

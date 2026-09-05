@@ -1,0 +1,15 @@
+# datasets and generated artifacts (multi-GB)
+dataset/
+output/
+!output/v5/
+output/v5/*
+!output/v5/deliverables/
+recordings/
+# environments
+.venv/
+.venv-mac/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.idea/
