@@ -1,15 +1,16 @@
-# datasets and generated artifacts (multi-GB)
+# datasets and generated artifacts (multi-GB); only output/v5/deliverables is tracked
 dataset/
-output/
+output/*
 !output/v5/
 output/v5/*
 !output/v5/deliverables/
 recordings/
-# environments
+# environments and build products
 .venv/
 .venv-mac/
 __pycache__/
 *.pyc
 .pytest_cache/
+esp32_firmware/v5/build/
 .DS_Store
 .idea/
