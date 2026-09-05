@@ -55,10 +55,10 @@
 ### Task 1: Environment, package skeleton, config loader
 
 **Files:**
-- Create: `pytest.ini`, `v5/__init__.py`, `v5/data/__init__.py`, `v5/recording/__init__.py`, `v5/config.py`, `v5/configs/default.yaml`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_config.py`
+- Create: `pytest.ini`, `v5/__init__.py`, `v5/data/__init__.py`, `v5/recording/__init__.py`, `v5/config.py`, `v5/versioning.py`, `v5/configs/default.yaml`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_config.py`
 
 **Interfaces:**
-- Produces: `v5.config.ROOT: Path` (repo root), `v5.config.load_config(path: Path | None = None) -> dict`, `v5.config.resolve(cfg: dict) -> dict` (adds absolute `paths.data_dir`, `paths.raw_dir`, `paths.out_dir`).
+- Produces: `v5.config.ROOT: Path` (repo root), `v5.config.load_config(path: Path | None = None) -> dict`, `v5.config.resolve(cfg: dict) -> dict` (adds absolute `paths.data_dir`, `paths.raw_dir`, `paths.out_dir`); `v5.versioning.MODEL_VERSION = "cnn_v5_int8"`, `v5.versioning.FORBIDDEN_VERSION_SUBSTRINGS = ("simulator", "demo", "mock")`, `v5.versioning.check_model_version(v: str) -> str` (raises `ValueError` when the version contains a forbidden substring, case-insensitive). Later tasks import the version rule from here; `v5/events.py` (Task 19) re-exports it.
 
 - [ ] **Step 1: Verify the environment**
 
@@ -82,6 +82,17 @@ def test_default_config_loads_and_resolves():
     assert cfg["model_version"] == "cnn_v5_int8"
     assert cfg["data"]["min_counts"]["train_pos"] == 1500 and cfg["threshold"]["min_calib_neg"] == 300
     assert cfg["data"]["whl_val_batches"] == ["000002", "100002"]
+
+
+def test_model_version_rule():
+    import pytest
+
+    from v5.versioning import MODEL_VERSION, check_model_version
+
+    assert check_model_version(MODEL_VERSION) == "cnn_v5_int8"
+    for bad in ("cnn_demo", "simulator_v5", "MOCK"):
+        with pytest.raises(ValueError):
+            check_model_version(bad)
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -205,6 +216,22 @@ def resolve(cfg: dict) -> dict:
     return out
 ```
 
+`v5/versioning.py`:
+```python
+"""Model version rule shared by training, export and cloud events (spec section 6)."""
+from __future__ import annotations
+
+MODEL_VERSION = "cnn_v5_int8"
+FORBIDDEN_VERSION_SUBSTRINGS = ("simulator", "demo", "mock")
+
+
+def check_model_version(v: str) -> str:
+    low = str(v).lower()
+    if any(s in low for s in FORBIDDEN_VERSION_SUBSTRINGS):
+        raise ValueError(f"model_version {v!r} would be treated as simulated data by the cloud")
+    return str(v)
+```
+
 `tests/conftest.py`:
 ```python
 import os
@@ -289,7 +316,7 @@ Expected: PASS
 
 ```bash
 git add pytest.ini v5 tests
-git commit -m "feat(v5): package skeleton, config loader and test fixtures"
+git commit -m "feat(v5): package skeleton, config loader, version rule and test fixtures"
 ```
 
 ---
@@ -1085,7 +1112,12 @@ def test_build_manifest_end_to_end(mini_dataset, tmp_path):
     dups = M.load_exact_dups(out)
     assert len(dups) == 1 and dups[0]["source"] == "kaggle_jibran" and dups[0]["kept_source"] == "kaggle_adria"
     assert "kaggle_adria ~ kaggle_jibran" in (out / "manifest_report.md").read_text()
-    assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
+    kaggle = [r for r in rows if r["source"].startswith("kaggle")]
+    assert kaggle and all(r["split"] in ("test", "drop") for r in kaggle)
+    audited = {d["id"] for d in dups} | {r["id"] for r in kaggle if r["md5"] in set(M.load_exact_conflicts(out))}
+    assert all(r["id"] in audited for r in kaggle if r["split"] == "drop")  # every dropped Kaggle row has a dedup or conflict reason
+    for h in {r["md5"] for r in kaggle if r["md5"] not in set(M.load_exact_conflicts(out))}:
+        assert sum(1 for r in kaggle if r["md5"] == h and r["split"] == "test") == 1  # one test copy per waveform
     assert all(r["split"] == "sanity" for r in rows if r["source"] == "wild")
     by_batch = {}
     for r in rows:
@@ -2532,7 +2564,7 @@ git commit -m "feat(v5): clip metrics, robustness sweep and int8 inference helpe
 - Consumes: `v5.data.manifest` (`read_manifest`, `load_cache`, `split_indices`), `v5.data.augment`, `v5.data.dataset`, `v5.model.build_model`, `v5.evaluate`, `v5.teacher` (`read_scores`, `platt_fit`, `platt_apply`).
 - Produces: `make_kd_loss(alpha: float) -> callable` and `kd_loss = make_kd_loss(0.5)`, `class ValAuc(keras.callbacks.Callback)`, `build_soft_targets(rows, teacher_csv, train_idx) -> np.ndarray`, `train_one(cfg, use_kd, width, epochs, name, seed=42) -> dict`, `class CalibrationError(RuntimeError)`, `fpr_upper_bound(fp, n, conf=0.95) -> float`, `choose_threshold(y_calib, p_calib, max_fpr=0.01, min_neg=300) -> tuple[float, dict]`, `select_config(results: list[dict]) -> dict`, `run_report(out_dir) -> str`, CLI `python -m v5.train {run,select,final,report}`.
 - Files: `output/v5/runs/<name>/{model.keras,metrics.json,history.json}`, `output/v5/selection.json`, `output/v5/deployed/{model.keras,metrics.json,threshold.json}` (one generation, written to `deployed.new/` and swapped in atomically), `output/v5/deliverables/experiments.md`.
-- `noise_bank_ids(rows, train_ids) -> np.ndarray` selects training negatives whose source is `mssnsd` or `esc50` (the augmentation noise bank of spec section 5); `deploy_generation(out_dir, run_dir, metrics: dict, threshold: dict) -> Path` stages `deployed.new/`, computes the model SHA from the staged file, writes `threshold.json` with it and swaps the directory in, restoring the previous one on failure. `train final` calls `check_model_version` (from `v5.events`) before deploying.
+- `noise_bank_ids(rows, train_ids) -> np.ndarray` selects training negatives whose source is `mssnsd` or `esc50` (the augmentation noise bank of spec section 5); `deploy_generation(out_dir, run_dir, metrics: dict, threshold: dict) -> Path` stages `deployed.new/`, computes the model SHA from the staged file, writes `threshold.json` with it and swaps the directory in, restoring the previous one on failure. `train final` calls `check_model_version` (from `v5.versioning`) before deploying.
 - `file_sha256(path) -> str`.
 - `deployed/threshold.json` schema: `{"tau": float, "model_version": str, "model_sha256": str (SHA-256 of the deployed model.keras), "max_fpr": float, "run": str, "calib": {"n_neg", "n_pos", "fp", "fpr", "fpr_upper95", "recall", "tau", "max_fpr"}, "fsm": {tick_ms, hold_s, confirm_s, verify_s, min_bursts, period_min_s, period_max_s}}`.
 - Calibration contract: tau is the smallest float strictly above the largest negative score that may still pass, so at most `floor(max_fpr * n_neg)` calibration negatives score at or above tau. Fewer than `min_neg` negatives, a tau above 1.0, or zero positive recall raise `CalibrationError`; nothing is written in that case.
@@ -2692,8 +2724,8 @@ from v5.data import manifest as M
 from v5.data.augment import AugmentConfig, Augmenter, RirBank
 from v5.data.dataset import TrainDataset, precompute_features
 from v5.evaluate import clip_metrics, predict_probs, sigmoid
-from v5.events import check_model_version
 from v5.model import build_model
+from v5.versioning import check_model_version
 
 _BCE = keras.losses.BinaryCrossentropy(from_logits=True)
 
@@ -2984,7 +3016,11 @@ def test_real_manifest_release_gate():
     rows = M.read_manifest(path)
     M.check_invariants(rows)
     M.check_min_counts(rows, load_config()["data"]["min_counts"])
-    assert all(r["split"] == "test" for r in rows if r["source"].startswith("kaggle"))
+    kaggle = [r for r in rows if r["source"].startswith("kaggle")]
+    assert all(r["split"] in ("test", "drop") for r in kaggle)
+    dropped = {r["id"] for r in kaggle if r["split"] == "drop"}
+    audited = {d["id"] for d in M.load_exact_dups(OUT)} | {r["id"] for r in kaggle if r["md5"] in set(M.load_exact_conflicts(OUT))}
+    assert dropped <= audited
     assert not any(r["category"] == "snoring" and r["label"] == 0 for r in rows)
     assert {r["category"] for r in rows if r["source"] == "whl_s" and r["split"] == "val"} == {"000002"}
 ```
@@ -4170,7 +4206,7 @@ git commit -m "feat(v5): DoA simulation sweep"
 - Create: `v5/events.py`, `tests/test_events.py`
 
 **Interfaces:**
-- Produces: `MODEL_VERSION = "cnn_v5_int8"`, `FORBIDDEN_VERSION_SUBSTRINGS`, `NOTE_MAX = 1000`, `@dataclass EdgeEvent(ts, snore_p, fsm_state, episode_id=None, side="unknown", lag_ms=0.0, doa_conf=0.0, level_dbfs=0.0, radar_presence=None, radar_motion=None, radar_breath_rate=None, temp_ok=True, vib_level=0, vib_ms=0)` with `to_dict()`, `check_model_version(v) -> str`, `to_cloud_event(device_id, ts, episode: dict, doa: dict | None = None, radar: dict | None = None, model_version=MODEL_VERSION) -> dict`.
+- Produces: `MODEL_VERSION`, `FORBIDDEN_VERSION_SUBSTRINGS`, `check_model_version` (re-exported from `v5.versioning`), `NOTE_MAX = 1000`, `@dataclass EdgeEvent(ts, snore_p, fsm_state, episode_id=None, side="unknown", lag_ms=0.0, doa_conf=0.0, level_dbfs=0.0, radar_presence=None, radar_motion=None, radar_breath_rate=None, temp_ok=True, vib_level=0, vib_ms=0)` with `to_dict()`, `check_model_version(v) -> str`, `to_cloud_event(device_id, ts, episode: dict, doa: dict | None = None, radar: dict | None = None, model_version=MODEL_VERSION) -> dict`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4239,8 +4275,8 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 
-MODEL_VERSION = "cnn_v5_int8"
-FORBIDDEN_VERSION_SUBSTRINGS = ("simulator", "demo", "mock")
+from v5.versioning import FORBIDDEN_VERSION_SUBSTRINGS, MODEL_VERSION, check_model_version  # noqa: F401  (re-exported)
+
 NOTE_MAX = 1000
 
 
@@ -4263,13 +4299,6 @@ class EdgeEvent:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def check_model_version(v: str) -> str:
-    low = v.lower()
-    if any(s in low for s in FORBIDDEN_VERSION_SUBSTRINGS):
-        raise ValueError(f"model_version {v!r} would be treated as simulated data by the cloud")
-    return v
 
 
 def to_cloud_event(device_id: str, ts: int, episode: dict, doa: dict | None = None, radar: dict | None = None, model_version: str = MODEL_VERSION) -> dict:
@@ -4315,7 +4344,7 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 **Interfaces:**
 - Consumes: `v5.features`, `v5.golden`, `v5.streaming` (`FsmParams`, `run_sequence`, state names), `v5.doa` (`DoaParams`, `DoaTracker`, `gcc_phat`), `v5.evaluate` (`make_interpreter`, `int8_probs`, `int8_parity`, `predict_probs`, `robustness_sweep`, `clip_metrics`), `v5.data.manifest`, `v5.data.dataset.precompute_features`, `v5.model.check_ops`.
-- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `claim_test_split(out_dir, manifest_sha, model_sha) -> dict | None` (records `output/v5/test_consumption.json`; returns the completed evaluation bundle when the same model re-exports; raises `ExportError` for a different model on the same manifest or for an incomplete, locked record), `persist_test_results(out_dir, bundle: dict, tflite: bytes, golden_files: dict[str, bytes]) -> Path` (writes `output/v5/test_evaluation/<model_sha>/` atomically and completes the record), `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
+- Produces: `GEN_DIR`, `ALLOWED_TFLITE_OPS`, `PARITY_LIMITS`, `class ExportError(RuntimeError)`, `claim_test_split(out_dir, manifest_sha, model_sha) -> dict | None` (records `output/v5/test_consumption.json`; returns the completed evaluation bundle when the same model re-exports; raises `ExportError` for a different model on the same manifest or for an incomplete, locked record), `persist_test_results(out_dir, results: dict, tflite: bytes, golden_files: dict[str, bytes]) -> Path` (computes the TFLite SHA-256 itself, refuses to overwrite a completed bundle, writes `output/v5/test_evaluation/<model_sha>/` atomically and completes the record); on reuse the bundle's TFLite bytes are re-hashed and must match the recorded SHA before any stored result is trusted, `precheck_release(model_path, thr: dict) -> str` (raises `ExportError` if `thr["model_version"]` contains a forbidden substring or `thr["model_sha256"]` does not equal the SHA-256 of the model file; returns the SHA), `check_threshold_binding(model_path, thr: dict) -> str`, `to_tflite_int8(model, rep_X) -> bytes`, `quant_params(tflite) -> dict`, `tflite_ops(tflite) -> list[str] | None`, `validate_tflite(tflite) -> dict` (raises `ExportError`), `check_parity(parity: dict) -> None` (raises), `arena_estimate(model, tflite_bytes: int) -> dict`, `write_c_array(data, name, h_path, c_path)`, `write_feature_spec_h(path)`, `write_mel_filterbank_h(path)`, `write_model_meta_h(path, qp, tau, fsm, model_version)`, `fsm_trace_sequence(seed=0, tau=0.65) -> list[float]`, `write_golden_fsm(path, params, seed=0)`, `doa_golden_cases(seed=0, params=DoaParams())`, `write_golden_doa_cases(path, params, seed=0)`, `doa_tracker_frames(seed=0, params=DoaParams()) -> list[tuple[np.ndarray, np.ndarray]]`, `write_golden_doa_tracker(path, params, seed=0)`, `write_headers_only(gen_dir, golden_dir, fsm, doa)`, `promote(stage, deliv, gen_dir)`, `export_model(cfg, model_path=None, threshold_path=None) -> dict`, `model_card(cfg) -> str`, CLI `python -m v5.export {headers,model,card}`.
 - Promotion is transactional: complete `.new` sibling trees are built for `deliverables/` and `generated/`, then swapped in by rename with `.bak` copies kept until both swaps succeed; any failure restores both previous trees. The successful `export_status.json` is written into the stage and travels inside the swap, so a live release always carries its own status; cleanup of backups and the stage after the swap is best-effort and never fails the export.
 - The exporter verifies the model version and `threshold.json`'s `model_sha256` before it reads the manifest or the test split.
 - One-time test evaluation is enforced by `output/v5/test_consumption.json` (outside the promoted trees) plus an immutable evaluation bundle `output/v5/test_evaluation/<model_sha>/` holding the exact evaluated TFLite bytes, the test-derived golden feature files, parity, metrics and robustness. The first export of a model reads the test split once and writes the bundle atomically; a re-export of the same model on the same manifest reuses the bundle (its TFLite bytes become the artifact) without calling `split_indices(..., "test")` or touching test audio; a different model on the same manifest, or an incomplete record left by an interrupted attempt, is refused with instructions to document the reason and delete the record deliberately. A rebuilt manifest (new SHA) starts a new record. A failed attempt writes its status to `output/v5/export_stage/export_status.json` and `output/v5/export_last_attempt.json`; the live `deliverables/export_status.json` belongs to the promoted release and is never modified by a failed attempt.
@@ -4326,6 +4355,7 @@ git commit -m "feat(v5): edge event schema and cloud payload converter"
 
 `tests/test_export.py`:
 ```python
+import hashlib
 import json
 
 import numpy as np
@@ -4426,7 +4456,12 @@ def test_test_split_is_consumed_once_per_manifest(tmp_path):
     bundle = X.persist_test_results(tmp_path, {"tflite_sha256": "t", "parity": {"passed": True}, "test_metrics": {}, "robustness": {}, "n_test": 8}, b"tflite-bytes", {"features.bin": b"g"})
     assert (bundle / "snore_v5_int8.tflite").read_bytes() == b"tflite-bytes" and (bundle / "golden" / "features.bin").read_bytes() == b"g"
     again = X.claim_test_split(tmp_path, "m1", "modelA")  # same model: the completed bundle, no test access needed
-    assert again["parity"]["passed"] is True and again["bundle_dir"] == str(bundle)
+    assert again["parity"]["passed"] is True and again["bundle_dir"] == str(bundle) and again["tflite_sha256"] == hashlib.sha256(b"tflite-bytes").hexdigest()
+    with pytest.raises(X.ExportError):
+        X.persist_test_results(tmp_path, {"parity": {"passed": True}}, b"other", {})  # a completed bundle is immutable
+    (bundle / "snore_v5_int8.tflite").write_bytes(b"tampered-but-structurally-plausible")
+    with pytest.raises(X.ExportError):
+        X.claim_test_split(tmp_path, "m1", "modelA")  # modified bundle: stored results are not trusted
     with pytest.raises(X.ExportError):
         X.claim_test_split(tmp_path, "m1", "modelB")  # another model on the same manifest
     assert X.claim_test_split(tmp_path, "m2", "modelB") is None  # a rebuilt manifest starts a new record
@@ -4554,6 +4589,10 @@ def claim_test_split(out_dir, manifest_sha: str, model_sha: str):
                 raise ExportError(f"a previous evaluation of model {model_sha[:12]} was interrupted before its bundle was completed; "
                                   "the record is locked. " + reset_hint)
             results = json.loads((bundle_dir / "results.json").read_text(encoding="utf-8"))
+            actual = hashlib.sha256((bundle_dir / "snore_v5_int8.tflite").read_bytes()).hexdigest()
+            if actual != results.get("tflite_sha256"):
+                raise ExportError(f"evaluation bundle {bundle_dir} was modified after evaluation (tflite sha256 {actual[:12]} != {str(results.get('tflite_sha256'))[:12]}); "
+                                  "its results cannot be trusted. " + reset_hint)
             results["bundle_dir"] = str(bundle_dir)
             return results
     _write_json_atomic(record, {"manifest_sha256": manifest_sha, "model_sha256": model_sha, "at": datetime.now().isoformat(timespec="seconds"), "complete": False})
@@ -4566,6 +4605,9 @@ def persist_test_results(out_dir, results: dict, tflite: bytes, golden_files: di
     record = out_dir / "test_consumption.json"
     prev = json.loads(record.read_text(encoding="utf-8"))
     final = out_dir / "test_evaluation" / prev["model_sha256"]
+    if final.exists() or prev.get("complete"):
+        raise ExportError(f"evaluation bundle {final} already exists; a completed evaluation is immutable")
+    results = {**results, "tflite_sha256": hashlib.sha256(tflite).hexdigest()}  # computed here, never trusted from the caller
     tmp = final.with_name(final.name + ".tmp")
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -4574,8 +4616,6 @@ def persist_test_results(out_dir, results: dict, tflite: bytes, golden_files: di
     for name, data in golden_files.items():
         (tmp / "golden" / name).write_bytes(data)
     (tmp / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
-    if final.exists():
-        shutil.rmtree(final)
     os.rename(tmp, final)
     prev["complete"] = True
     _write_json_atomic(record, prev)
@@ -4583,7 +4623,7 @@ def persist_test_results(out_dir, results: dict, tflite: bytes, golden_files: di
 
 
 def precheck_release(model_path, thr: dict) -> str:
-    from v5.events import check_model_version
+    from v5.versioning import check_model_version
 
     try:
         check_model_version(str(thr.get("model_version", "")))
@@ -4952,6 +4992,8 @@ def export_model(cfg: dict, model_path=None, threshold_path=None) -> dict:
         else:  # repeat export of the same model: the bundle is the artifact, no test access at all
             bundle = Path(persisted["bundle_dir"])
             tflite = (bundle / "snore_v5_int8.tflite").read_bytes()
+            if hashlib.sha256(tflite).hexdigest() != persisted["tflite_sha256"]:
+                raise ExportError("evaluation bundle tflite does not match its recorded sha256")
             valid = validate_tflite(tflite)
             for name in ("features.npz", "features.bin"):
                 shutil.copy(bundle / "golden" / name, golden / name)
