@@ -2191,6 +2191,14 @@ def test_choose_threshold_fallback_and_selection():
     assert 0.5 <= tau <= 0.62
     assert ((p[y == 0] >= tau).mean()) <= 0.01
     assert TR.choose_threshold(y[:250], p[:250], max_fpr=0.01, fallback=0.65) == 0.65
+    # a high-scoring negative class must push the threshold up, never be clipped to a fixed cap
+    y2 = np.array([1] * 300 + [0] * 300)
+    p2 = np.r_[np.full(300, 0.995), np.full(300, 0.98)]
+    tau2 = TR.choose_threshold(y2, p2, max_fpr=0.01)
+    assert tau2 > 0.98 and (p2[y2 == 0] >= tau2).mean() <= 0.01
+    # negatives that all score above every positive: no finite threshold works -> fallback
+    p3 = np.r_[np.full(300, 0.2), np.full(300, 0.9)]
+    assert TR.choose_threshold(y2, p3, max_fpr=0.01, fallback=0.65) == 0.65
 
 
 def test_select_config_prefers_smallest_near_best():
@@ -2359,7 +2367,10 @@ def choose_threshold(y_val, p_val, max_fpr: float = 0.01, fallback: float = 0.65
     ok = np.nonzero(fpr <= max_fpr + 1e-12)[0]
     if len(ok) == 0:
         return float(fallback)
-    return float(np.clip(thr[ok[-1]], 0.05, 0.95))
+    tau = float(thr[ok[-1]])  # smallest threshold that still meets the FPR target
+    if not np.isfinite(tau) or tau > 1.0:  # only the "reject everything" point qualifies
+        return float(fallback)
+    return tau
 
 
 def select_config(results: list[dict]) -> dict:
@@ -3229,6 +3240,16 @@ def test_tracker_episode_side_and_confidence():
     assert t.episode()["side"] == "right"
 
 
+def test_noise_floor_adapts_up_slowly_and_down_fast():
+    nf = D.NoiseFloor()
+    for _ in range(2000):
+        nf.update(-40.0)
+    assert nf.db > -41.0  # converged up to the steady level
+    for _ in range(200):
+        nf.update(-70.0)
+    assert nf.db < -68.0  # fast decay back down
+
+
 def test_side_from_lag_deadzone():
     assert D.side_from_lag(0.5, 4) == "unknown" and D.side_from_lag(1.0, 4) == "left" and D.side_from_lag(-1.0, 4) == "right"
 
@@ -3308,12 +3329,15 @@ def frame_level_db(x) -> float:
 
 
 class NoiseFloor:
-    def __init__(self, init_db: float = -60.0, alpha: float = 0.02):
-        self.db, self.alpha = init_db, alpha
+    """Tracks the ambient level: fast when the input is near or below the floor, slow upward
+    otherwise, so a steady loud background (a fan) eventually stops counting as signal."""
+
+    def __init__(self, init_db: float = -60.0, alpha: float = 0.02, alpha_up: float = 0.002):
+        self.db, self.alpha, self.alpha_up = init_db, alpha, alpha_up
 
     def update(self, level_db: float) -> float:
-        if level_db < self.db + 5.0:
-            self.db += self.alpha * (level_db - self.db)
+        rate = self.alpha if level_db < self.db + 5.0 else self.alpha_up
+        self.db += rate * (level_db - self.db)
         return self.db
 
 
@@ -4704,7 +4728,8 @@ int doa_tracker_frame(doa_tracker_t *t, const float *l, const float *r, float *l
     double sq = 0.0;
     for (int n = 0; n < N; n++) sq += (double)l[n] * (double)l[n];
     float level = 20.0f * log10f(sqrtf((float)(sq / N)) + 1e-9f);
-    if (level < t->floor_db + 5.0f) t->floor_db += 0.02f * (level - t->floor_db);
+    float rate = (level < t->floor_db + 5.0f) ? 0.02f : 0.002f; /* same rule as v5/doa.py NoiseFloor */
+    t->floor_db += rate * (level - t->floor_db);
     float lag, ratio;
     doa_gcc_phat(l, r, t->max_lag, t->band_lo, t->band_hi, &lag, &ratio);
     int valid = level >= t->floor_db + t->floor_margin_db && ratio >= t->min_ratio;
