@@ -81,7 +81,7 @@ All constants live in `v5/features.py` and are emitted to `output/v5/feature_spe
 | mel filterbank | 30 triangular filters, HTK mel scale, fmin 40 Hz, fmax 6000 Hz, peak gain 1.0, evaluated at bin centre frequencies `k * 16000 / 512` |
 | log | `L = 10 log10(M + 1e-10)` |
 | normalisation | `X = clip((L - mean(L)) / 40, -1, 1)`, mean over all 61×30 cells |
-| output | float32 (61, 30), gain-invariant; digital silence maps to all zeros |
+| output | float32 (61, 30); gain-invariant for cells well above the 1e-10 power floor (all realistic audio; digital silence maps to all zeros) |
 
 The filterbank is generated once in Python and written as a sparse C table
 (`mel_filterbank.h`: per filter `start_bin`, `n_bins`, weights). C never recomputes it.
@@ -101,8 +101,8 @@ max |ΔX| ≤ 5e-3 before quantisation; after quantisation at most ±1 LSB on �
 
 | id | path | label | group key | split |
 |---|---|---|---|---|
-| kaggle_adria | `dataset/adrianagaler/{snore,noise}` | folder | file | test (immutable; evaluated once by the exporter) |
-| kaggle_jibran | `dataset/snoring_extra/jibran/jibran_{s,n}_*` | filename | file | test |
+| kaggle_adria | `dataset/adrianagaler/{snore,noise}` | folder | near-duplicate cluster (twins with jibran) | half of the clusters train, half immutable test (evaluated once by the exporter) |
+| kaggle_jibran | `dataset/snoring_extra/jibran/jibran_{s,n}_*` | filename | same clusters as adrianagaler | same |
 | whl_s | `dataset/whltalent/s*/` 834 raw 10 s recordings | snore | `whl_<batch>_<stem>`; batch = file-name prefix | train, except batch `000002` → val |
 | whl_e | `dataset/whltalent/e*/` 1520 raw 10 s recordings | noise | same | train, except batch `100002` → val |
 | esc50 | `dataset/esc50/audio` 2000 × 5 s @ 44.1 kHz + `meta/esc50.csv` | category `snoring` → snore, all other categories → noise | official fold | folds 1–3 train, fold 4 val, fold 5 calib |
@@ -153,8 +153,16 @@ One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity
 - `val` (early stopping and model selection): half of the recordings of WHLTalent batches `000002`
   (snore) and `100002` (environment), ESC-50 fold 4, 15 % of the non-bench MS-SNSD files.
 - `calib` (threshold calibration only): ESC-50 fold 5, 15 % of the non-bench MS-SNSD files.
-- `test` (final evaluation, used exactly once by the exporter): the whole Kaggle set. It is never
-  used for training, selection, calibration, augmentation banks or synthetic-night material.
+- `test` (final evaluation, used exactly once by the exporter): half of the Kaggle near-duplicate
+  clusters (seeded 42; the adrianagaler/jibran twins always stay together). It is never used for
+  training, selection, calibration, augmentation banks or synthetic-night material. The other half
+  of the Kaggle clusters is training material.
+- Why Kaggle is split (finding of 2026-09-05): the teacher hears snoring in only 9 % of the
+  WHLTalent batch-000000 "snore" windows (86 % score below 0.02) and a model trained on batches
+  000000/100000/100001 transfers *inversely* to batch 000002 (WHL-only validation AUC 0.15–0.34):
+  those recordings carry batch signatures, not audible snoring. Kaggle is the only sizeable audible
+  snore source on hand, so half of it must train the model; WHLTalent batch 000002 remains the
+  cross-collection validation and bench material.
 - `bench`: the other half of the WHLTalent validation-batch recordings (snore and environment,
   recording-disjoint from `val`) plus 20 % of MS-SNSD files (seeded 42). This is the only material
   for the streaming benchmark and the DoA sweep, and the MS-SNSD part supplies noise beds and
@@ -171,12 +179,20 @@ One `split` column with values `train`, `val`, `calib`, `test`, `bench`, `sanity
   together; Kaggle is a separate collection.
 - Class balance: batches are sampled 1:2 positive:negative; loss is unweighted.
 
-Expected volumes: ≈ 2 k positive and ≈ 6 k negative training windows, ≈ 235 validation and ≈ 235
-bench positives, ≥ 1 k calibration negatives, ≈ 1 k Kaggle test windows after dedup.
+Volumes after the audit (2026-09-05 build): 551 verified positive and ≈ 5.1 k negative training
+windows, 126 validation and 108 bench positives, 1,013 calibration negatives, 514 positive and
+484 negative Kaggle test windows.
 
-### 4.5 Label audit (only when the teacher is available)
+### 4.5 Teacher audit (mandatory positive verification)
 
-YAMNet scores training-split windows only (never validation, calibration, bench or test): positives with `P(Snoring) + P(Snort) < 0.02` are flagged
+YAMNet scores every window of `train`, `val`, `calib` and `bench` (never `test`). The audit is
+applied to the manifest (`python -m v5.data.manifest --apply-audit`) before any training:
+positives with `P(Snoring) + P(Snort) < 0.1` are dropped as `unverified_positive`, negatives with
+`P > 0.5` as `snore_in_negative`, each with row-level provenance and counts in the report. On the
+real data this removes 1,844 of the 2,028 batch-000000 positives, 259 of 474 batch-000002
+positives, 163 of 486 Kaggle-train positives and 35 of 79 ESC-50 positives, leaving ≈ 550 verified
+training positives. Minimum counts (config `data.min_counts`) are enforced after the audit.
+Earlier text of this section: positives with `P(Snoring) + P(Snort) < 0.02` are flagged
 `weak_positive` and kept; negatives with `> 0.5` are flagged `snore_in_negative` and excluded
 from training. Flag counts go to `manifest_report.md`.
 
@@ -224,7 +240,8 @@ soft target for every augmented view of that window: `loss = 0.5·BCE(y) + 0.5·
 
 Selection rule (validation split): compare {hard-label, KD} × {width 1.0, width 2.0} and pick the
 smallest configuration whose validation AUC is within 0.005 of the best and whose validation recall
-at 2 % false-positive rate is within 2 points of the best. The selected run's weights are deployed
+at 2 % false-positive rate is within 2 points of the best; when no run satisfies both, the AUC-near-best
+runs are ranked by recall instead. The selected run's weights are deployed
 as they are; there is no refit on more data, so the test evaluation applies to the deployed weights.
 
 Threshold τ (calibration split): the smallest float strictly above the largest negative score that
@@ -308,7 +325,8 @@ Intervention start/stop, cooldown, budget and temperature stay in the firmware s
 
 - Per frame: GCC-PHAT with bins outside 60–3000 Hz zeroed; lag search within ± max lag with
   parabolic sub-sample interpolation; valid if frame RMS is ≥ 6 dB above the noise floor as it
-  stood before this frame and the PHAT peak is ≥ 1.5 × the second-highest peak outside ± 1 sample.
+  stood before this frame and the PHAT peak within ± max lag is ≥ 1.5 × the highest correlation anywhere else in the
+  512-lag circular correlation (excluding the peak and its two neighbours).
   The floor tracks quickly when the frame is near or below it, adapts slowly upward for loud
   incoherent frames (so a fan eventually stops counting as signal) and is never raised by loud
   coherent frames (so a long snoring episode keeps its own validity).
