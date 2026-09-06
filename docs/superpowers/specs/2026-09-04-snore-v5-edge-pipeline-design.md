@@ -267,9 +267,17 @@ Failure blocks the release. The one-time rule is enforced: `output/v5/test_consu
 records which model (SHA-256) consumed the test split of which manifest (SHA-256), and the first
 evaluation writes an immutable bundle (`output/v5/test_evaluation/<model_sha>/`: the exact
 evaluated TFLite bytes, the test-derived golden features, parity, metrics, robustness). A repeat
-export of the same model reuses the bundle without any test access; a different model, or an
-interrupted attempt that left the record incomplete, is refused unless the record and bundle are
-deliberately deleted and the reason documented in the model card.
+export of the same model reuses the bundle without any test access. The record also stores the
+threshold τ the bundle was evaluated at and the SHA-256 of every bundle file (TFLite, results,
+golden vectors); reuse is refused when τ was re-calibrated (the test metrics and the parity
+agreement hold only at the evaluated τ) or any bundle file differs, and the parity gate is always
+re-decided from the stored numbers and the current limits, never from a stored flag. A different
+model, a rebuilt manifest (the record persists across manifest generations, so re-slicing the data
+never grants a fresh evaluation), or an interrupted attempt that left the record incomplete, is
+refused. The only way to evaluate again is `python -m v5.export reset-test-record --reason "..."`,
+which appends the timestamped reason to the persistent ledger `output/v5/test_consumption_resets.log`
+before removing the record and every bundle; the model card prints the ledger, and a fresh claim is
+refused while an earlier release or leftover bundle exists without a later ledger entry.
 
 Streaming benchmark (`benchmark_nights.py`): 20 synthetic nights of 1 h each, seeded, built from
 bench-partition snore and distractor windows over beds made only from bench MS-SNSD negative files
@@ -329,7 +337,9 @@ Intervention start/stop, cooldown, budget and temperature stay in the firmware s
   512-lag circular correlation (excluding the peak and its two neighbours).
   The floor tracks quickly when the frame is near or below it, adapts slowly upward for loud
   incoherent frames (so a fan eventually stops counting as signal) and is never raised by loud
-  coherent frames (so a long snoring episode keeps its own validity).
+  coherent frames (so a long snoring episode keeps its own validity). A frame with less than 5 % of its
+  L-channel power inside 60–3000 Hz, or whose correlation has no usable peak, reports lag 0 and
+  ratio 0 and is never valid; a golden case with a loud 5 kHz tone covers it.
 - Per episode: valid frame lags go into a histogram (0.01-sample bins over ± max lag) with
   per-frame side counters, so episodes of any length use bounded memory; lag = lower-median bin
   centre; side = left if lag > +0.2 · max lag, right if < −0.2 · max lag, else unknown;
@@ -366,7 +376,8 @@ into the stage and travels inside the swap; a failed attempt is recorded in the 
 `output/v5/export_last_attempt.json` and never touches the live release; post-swap cleanup is
 best-effort. Gates (checked after the model-version rule and the threshold/model SHA-256 binding): TFLite input/output are int8 with shapes [1,61,30,1] and [1,1]; the operator
 set is within {CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED, LOGISTIC, RESHAPE, QUANTIZE,
-DEQUANTIZE}; int8 parity on the test split meets the limits of section 7. A failed gate raises,
+DEQUANTIZE} and must be enumerable (an interpreter that cannot list the operators fails the gate);
+int8 parity on the test split meets the limits of section 7. A failed gate raises,
 keeps the stage directory for diagnosis, records `failed` in `deliverables/export_status.json` and
 leaves previously promoted files untouched. Promoted files under `output/v5/deliverables/`:
 
@@ -374,12 +385,14 @@ leaves previously promoted files untouched. Promoted files under `output/v5/deli
 - `model_data.h` / `model_data.c` (`const unsigned char snore_v5_int8_tflite[]` aligned 16, length)
 - `model_meta.h` (INPUT_SCALE, INPUT_ZERO_POINT, OUTPUT_SCALE, OUTPUT_ZERO_POINT, SNORE_THRESHOLD,
   MODEL_VERSION, FEATURE_SPEC_VERSION, FSM parameters), `mel_filterbank.h`, `feature_spec.h`
-- `export_info.json`, `export_status.json`, `test_metrics.json`, `robustness.json`
+- `export_info.json`, `export_status.json`, `test_metrics.json`, `robustness.json`,
+  `feature_spec.json` (the frozen constants, emitted from the same definitions as the headers)
 - `golden/` (features with quantised copies, FSM trace with end-event fields, DoA frame cases and a
   tracker sequence)
-- `model_card.md`, assembled by `export card` after the benchmark and the DoA sweep; it contains the
-  single test evaluation, the parity gate, robustness, calibration, an activation-memory estimate
-  and the call sequence. Desktop tests establish numerical parity, not ESP32-S3 deployability: the
+- `model_card.md`, assembled by `export card` after the benchmark and the DoA sweep; both reports
+  record the release they were produced for (model, TFLite and manifest SHA-256) and the card refuses
+  a missing or stale report; it contains the single test evaluation, the parity gate, robustness,
+  calibration, an activation-memory estimate and the call sequence. Desktop tests establish numerical parity, not ESP32-S3 deployability: the
   firmware build must still verify the TFLM operator resolver, the real tensor arena and flash use.
 
 C sources under `esp32_firmware/v5/` (C99, no malloc, no dependencies beyond libm):
@@ -387,10 +400,15 @@ C sources under `esp32_firmware/v5/` (C99, no malloc, no dependencies beyond lib
 - `fft512.c/.h` radix-2 complex FFT reference (firmware may substitute esp-dsp; both must pass the
   host tests)
 - `snore_features.c/.h`: `sf_compute(const int16_t win[16000], float X[61*30])` and
-  `sf_quantize(const float X[], int8_t q[], float scale, int zp)`
-- `snore_episode_fsm.c/.h`: `fsm_init(params)`, `fsm_tick(p, level) -> event`, readable last-episode
-  fields (duration, mean probability, burst and hit counts, level)
-- `doa_gccphat.c/.h`: `doa_gcc_phat(l[512], r[512]) -> lag, ratio`, `doa_tracker_*`
+  `sf_quantize(const float X[], int8_t q[], float scale, int zp)`; work buffers are static (about
+  5 KB in .bss, nothing on the task stack), so the functions are not reentrant
+- `snore_episode_fsm.c/.h`: `fsm_init(params) -> 0 or -1` (refuses parameters beyond the fixed
+  capacities: hold + 1 ≤ 64 history entries, confirm + hold + 1 ≤ 64 bursts and hits; the exporter
+  checks the same limits before writing `model_meta.h`), `fsm_tick(p, level) -> event`, readable
+  last-episode fields (duration, mean probability, burst and hit counts, level)
+- `doa_gccphat.c/.h`: `doa_gcc_phat(l[512], r[512]) -> lag, ratio` on float frames plus
+  `doa_gcc_phat_i16` / `doa_tracker_frame_i16` taking the firmware's int16 frames, `doa_tracker_*`;
+  static work buffers (about 12 KB in .bss), not reentrant
 - `host_test/` with `test_features.c`, `test_fsm.c`, `test_doa.c` and Makefile targets
   `test-features`, `test-fsm`, `test-doa`, `test`; each exits non-zero on any mismatch and pytest
   runs them when a C compiler exists.
@@ -427,8 +445,11 @@ and the gated exporter like any other run.
   below the configured minimum: the manifest build raises `DatasetMissing`; nothing is written as if
   it had succeeded. Optional sources (Kaggle, wild) and undecodable files are logged in
   `output/v5/manifest_errors.csv`.
-- Teacher unavailable (no network, hub failure): KD and the label audit are disabled, a warning is
-  printed, and the run metrics record that hard labels only were used.
+- Teacher unavailable (no network, hub failure): the audit cannot be applied and training refuses
+  the manifest (`AuditRequired`) unless `train.allow_unaudited` is set explicitly; such runs record
+  `audit.applied = false` in their metrics. Every run also records the manifest, validation-id and
+  model SHA-256; `select` only considers runs made on the current manifest whose model file still
+  matches, and `final` recomputes the validation AUC of the selected model before deploying.
 - Calibration that cannot meet the FPR target: `CalibrationError`; no model is deployed and no
   `threshold.json` is written.
 - Export gate failure (dtype, shape, operator set, parity): `ExportError`; the stage directory is
