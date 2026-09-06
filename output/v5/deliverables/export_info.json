@@ -1,0 +1,153 @@
+{
+ "fsm": {
+  "tau": 0.8060498833656311,
+  "tick_ms": 500,
+  "hold_ticks": 12,
+  "confirm_ticks": 20,
+  "verify_ticks": 30,
+  "min_bursts": 3,
+  "period_min_ticks": 3,
+  "period_max_ticks": 14
+ },
+ "doa_sweep": {
+  "trials": 50,
+  "seed": 42,
+  "spacings_m": [
+   0.04,
+   0.06,
+   0.08,
+   0.12
+  ],
+  "distances_m": [
+   0.5,
+   1.0,
+   1.5
+  ],
+  "snrs_db": [
+   0,
+   5,
+   10,
+   20
+  ],
+  "n_snore_windows": 108
+ },
+ "benchmark": {
+  "n_nights": 20,
+  "night_s": 3600.0,
+  "snrs_db": [
+   0.0,
+   5.0,
+   10.0,
+   20.0
+  ],
+  "seed": 42
+ },
+ "model_version": "cnn_v5_int8",
+ "model_sha256": "c0d3ac44ba0d8ae4387734a25c445248a417ec6835a63e2f739b573550b3546f",
+ "manifest_sha256": "e7dd580f6a0e853256a3e7df75c330183ffaf21ae2ee75a1b867c6731a3e0121",
+ "tau": 0.8060498833656311,
+ "run": "hard_w1",
+ "calib": {
+  "tau": 0.8060498833656311,
+  "n_neg": 1013,
+  "n_pos": 17,
+  "fp": 10,
+  "fpr": 0.009871668311944718,
+  "fpr_upper95": 0.016687001783597985,
+  "recall": 0.5294117647058824,
+  "max_fpr": 0.01
+ },
+ "tflite_bytes": 34336,
+ "tflite_sha256": "754c8b0ad436fe899b50a123d22d7fc578b61c3f7e2d85efc51649e1c7d71acf",
+ "params": 25745,
+ "qp": {
+  "input_scale": 0.007843137718737125,
+  "input_zero_point": -1,
+  "output_scale": 0.00390625,
+  "output_zero_point": -128,
+  "input_shape": [
+   1,
+   61,
+   30,
+   1
+  ],
+  "output_shape": [
+   1,
+   1
+  ],
+  "input_dtype": "int8",
+  "output_dtype": "int8",
+  "ops": [
+   "CONV_2D",
+   "FULLY_CONNECTED",
+   "LOGISTIC",
+   "MAX_POOL_2D",
+   "MEAN"
+  ],
+  "ops_checked": true
+ },
+ "parity": {
+  "delta_auc": 0.00011858057047298143,
+  "agreement": 0.998997995991984,
+  "max_abs_diff": 0.02788599033810535,
+  "passed": true
+ },
+ "parity_limits": {
+  "delta_auc": 0.005,
+  "agreement": 0.99,
+  "max_abs_diff": 0.05
+ },
+ "arena": {
+  "activation_bytes_estimate": 60608,
+  "largest_tensor_bytes": 29280,
+  "flash_bytes": 34336,
+  "note": "int8 activations; two largest consecutive tensors plus scratch; measure the real arena on the device"
+ },
+ "test": {
+  "float": {
+   "n": 998,
+   "n_pos": 514,
+   "auc": 0.997777116763675,
+   "recall_at_fpr2": 0.9844357976653697,
+   "tau": 0.8060498833656311,
+   "precision": 0.9959677419354839,
+   "recall": 0.9610894941634242,
+   "fnr": 0.038910505836575876,
+   "fpr": 0.004132231404958678,
+   "cm": [
+    [
+     482,
+     2
+    ],
+    [
+     20,
+     494
+    ]
+   ]
+  },
+  "int8": {
+   "n": 998,
+   "n_pos": 514,
+   "auc": 0.997658536193202,
+   "recall_at_fpr2": 0.9844357976653697,
+   "tau": 0.8060498833656311,
+   "precision": 0.9959758551307847,
+   "recall": 0.9630350194552529,
+   "fnr": 0.03696498054474708,
+   "fpr": 0.004132231404958678,
+   "cm": [
+    [
+     482,
+     2
+    ],
+    [
+     19,
+     495
+    ]
+   ]
+  }
+ },
+ "n_test": 998,
+ "test_evaluated_from_bundle": false,
+ "exported_at": "2026-09-05T20:00:42"
+}

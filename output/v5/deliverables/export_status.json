@@ -1,0 +1,7 @@
+{
+ "status": "ok",
+ "at": "2026-09-05T20:00:42",
+ "model_version": "cnn_v5_int8",
+ "model_sha256": "c0d3ac44ba0d8ae4387734a25c445248a417ec6835a63e2f739b573550b3546f",
+ "tflite_sha256": "754c8b0ad436fe899b50a123d22d7fc578b61c3f7e2d85efc51649e1c7d71acf"
+}
