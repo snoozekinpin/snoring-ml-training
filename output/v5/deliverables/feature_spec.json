@@ -1,0 +1,19 @@
+{
+ "version": 1,
+ "sample_rate": 16000,
+ "window": 16000,
+ "stream_hop": 8000,
+ "n_fft": 512,
+ "hop": 256,
+ "n_frames": 61,
+ "n_bins": 257,
+ "n_mels": 30,
+ "fmin": 40.0,
+ "fmax": 6000.0,
+ "mel_scale": "htk",
+ "log_eps": 1e-10,
+ "norm_div": 40.0,
+ "window_type": "hann_periodic",
+ "spectrum": "power",
+ "normalisation": "clip((10log10(mel+eps) - mean)/40, -1, 1)"
+}

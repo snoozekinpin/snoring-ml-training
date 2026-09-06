@@ -1,0 +1,76 @@
+seed: 42
+model_version: cnn_v5_int8
+paths:
+  data_dir: dataset
+  raw_dir: dataset/RAW
+  out_dir: output/v5
+data:
+  whl_val_batches: ["000002", "100002"]   # WHLTalent batch ids (file-name prefix) held out for validation
+  esc50_val_fold: 4
+  esc50_calib_fold: 5
+  whl_bench_frac: 0.5      # share of the validation-batch recordings reserved for the streaming/DoA benchmarks
+  kaggle_train_frac: 0.5   # share of Kaggle near-duplicate clusters used for training; the rest is the immutable test half
+  audit_pos_threshold: 0.1 # teacher P(snoring+snort) below this: positive dropped as unverified
+  audit_neg_threshold: 0.5 # teacher P above this: negative dropped as contaminated
+  bench_frac: 0.2
+  mssnsd_val_frac: 0.15
+  mssnsd_calib_frac: 0.15
+  near_dup_threshold: 0.98
+  whl_snore_max_windows: 3
+  whl_env_max_windows: 2
+  esc50_max_windows: 2
+  esc50_snore_max_windows: 3
+  mssnsd_stride_s: 5
+  mssnsd_max_windows: 40
+  min_counts:
+    train_pos: 400
+    train_neg: 3000
+    val_pos: 50
+    val_neg: 500
+    calib_neg: 300
+    test_pos: 200
+    test_neg: 200
+    bench_pos: 50
+    bench_neg: 100
+augment:
+  rir_bank_size: 300
+  p_rir: 0.6
+  p_noise_pos: 0.7
+  p_noise_neg: 0.4
+  snr_range: [-5, 20]
+  p_tilt: 0.3
+  tilt_range: [-0.5, 0.5]
+  p_shift: 0.5
+  shift_ms: 100
+  p_gain: 0.3
+  gain_range: [-12, 6]
+  p_specaug: 0.5
+train:
+  epochs: 60
+  batch: 64
+  lr: 0.002
+  lr_min: 0.00002
+  patience: 10
+  width: 1.0
+  kd_alpha: 0.5
+threshold:
+  max_fpr: 0.01
+  min_calib_neg: 300
+fsm:
+  tick_ms: 500
+  hold_s: 6
+  confirm_s: 10
+  verify_s: 15
+  min_bursts: 3
+  period_min_s: 1.5
+  period_max_s: 7.0
+doa:
+  spacing_m: 0.06
+  sim_trials: 50                      # approved DoA sweep; the model card refuses reports made with other values
+  sim_spacings_m: [0.04, 0.06, 0.08, 0.12]
+  sim_distances_m: [0.5, 1.0, 1.5]
+  sim_snrs_db: [0, 5, 10, 20]
+benchmark:
+  n_nights: 20
+  night_s: 3600
+  snrs: [0, 5, 10, 20]
